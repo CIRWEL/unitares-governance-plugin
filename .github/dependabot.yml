@@ -1,0 +1,35 @@
+version: 2
+updates:
+  # No runtime dependencies — pytest is the only declared package, so the
+  # pip block is deliberately minimal rather than mirroring the larger
+  # grouped configs in unitares/anima-mcp.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 2
+    groups:
+      dev-deps:
+        patterns:
+          - "pytest*"
+        update-types:
+          - "minor"
+          - "patch"
+    labels:
+      - "dependencies"
+
+  # This repo is the installable adapter bundle other people consume, so
+  # keeping its CI actions current is the higher-value half of this config.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 2
+    groups:
+      actions:
+        patterns: ["*"]
+    labels:
+      - "dependencies"
+      - "ci"
