@@ -2,6 +2,39 @@
 
 Use this path if you are working from Codex or ChatGPT and want the cleanest UNITARES workflow without depending on Claude-only hooks.
 
+## Install In Codex
+
+Add this repository as a marketplace source:
+
+```bash
+codex plugin marketplace add cirwel/unitares-governance-plugin
+```
+
+Start Codex, open `/plugins`, install and enable `UNITARES Governance`, then
+start a new session. The bundle registers the local server at
+`http://localhost:8767/mcp/` and loads a Codex-specific synchronous hook file.
+Open `/hooks` to review and trust those command hooks; Codex skips untrusted
+plugin hooks by design.
+
+Claude uses `.mcp.json`, including its `UNITARES_SERVER_URL` expansion, and the
+async handlers in `hooks/hooks.json`. Codex uses the concrete local transport
+in `.codex-mcp.json` and synchronous `hooks/codex-hooks.json`. The separate
+files keep each host's configuration and execution contracts explicit.
+
+For a non-local server, disable the bundled local transport and register a
+separate URL whose server name still contains `unitares` so the lifecycle
+matchers apply:
+
+```toml
+# ~/.codex/config.toml
+[plugins."unitares-governance@unitares-governance".mcp_servers.unitares-governance]
+enabled = false
+```
+
+```bash
+codex mcp add unitares-governance-remote --url "${UNITARES_SERVER_URL%/}/mcp/"
+```
+
 ## Goal
 
 Connect to a running UNITARES governance server, preserve continuity cleanly,

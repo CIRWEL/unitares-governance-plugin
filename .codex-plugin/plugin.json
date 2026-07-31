@@ -1,6 +1,6 @@
 {
   "name": "unitares-governance",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "description": "Governance client for UNITARES: onboarding, diagnostics, dialectic review, and knowledge graph guidance.",
   "author": {
     "name": "CIRWEL",
@@ -18,6 +18,8 @@
     "unitares"
   ],
   "skills": "./skills/",
+  "mcpServers": "./.codex-mcp.json",
+  "hooks": "./hooks/codex-hooks.json",
   "interface": {
     "displayName": "UNITARES Governance",
     "shortDescription": "Governance client for agent state, review, and shared memory.",
