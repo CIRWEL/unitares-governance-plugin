@@ -27,7 +27,7 @@ from _redact import redact_secrets
 
 DEFAULT_SERVER_URL = "http://localhost:8767"
 DEFAULT_LOG_PATH = "~/.unitares/checkins.log"
-DEFAULT_PLUGIN_VERSION = "0.4.9"
+DEFAULT_PLUGIN_VERSION = "0.4.10"
 # process_agent_update can take 5–10s under the anyio-asyncio mitigation
 # paths in governance_core. 20s gives headroom without wedging Claude
 # turns for absurd lengths when governance is genuinely hung.

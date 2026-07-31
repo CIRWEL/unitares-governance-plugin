@@ -1146,3 +1146,83 @@ class TestWorkspaceCoordinationBriefing:
         payload = json.loads(stdout)
         assert "Workspace coordination" not in payload.get("additional_context", "")
         assert "additionalContext" in payload.get("hookSpecificOutput", {})
+
+    def _seed_repo(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_q(repo, "init", "-q", "-b", "master")
+        (repo / "README.md").write_text("seed\n")
+        _git_q(repo, "add", ".")
+        _git_q(repo, "commit", "-qm", "init")
+        return repo
+
+    def _add_sibling(self, repo, tmp_path, branch, *, dirty_files=()):
+        wt = tmp_path / branch.replace("/", "_")
+        _git_q(repo, "worktree", "add", "-q", "-b", branch, str(wt))
+        for dirty_file in dirty_files:
+            (wt / dirty_file).write_text("change\n")
+        return wt
+
+    def test_self_on_agent_branch_not_reported_as_sibling(self, tmp_path):
+        _repo, sibling = self._repo_with_sibling(tmp_path, dirty=True)
+        stdout, _ = _run_hook(tmp_path, "http://127.0.0.1:1", cwd=sibling)
+        ctx = json.loads(stdout).get("additional_context", "")
+        assert "Workspace coordination" not in ctx
+
+    def test_briefing_preserves_filenames_with_spaces(self, tmp_path):
+        repo = self._seed_repo(tmp_path)
+        self._add_sibling(
+            repo,
+            tmp_path,
+            "codex/spaces",
+            dirty_files=("my shared file.py",),
+        )
+        stdout, _ = _run_hook(tmp_path, "http://127.0.0.1:1", cwd=repo)
+        ctx = json.loads(stdout).get("additional_context", "")
+        assert "my shared file.py" in ctx
+
+    def test_briefing_counts_dirty_siblings_and_marks_truncation(self, tmp_path):
+        repo = self._seed_repo(tmp_path)
+        self._add_sibling(
+            repo,
+            tmp_path,
+            "codex/dirty-a",
+            dirty_files=("a.py", "b.py", "c.py", "d.py"),
+        )
+        self._add_sibling(
+            repo,
+            tmp_path,
+            "claude/dirty-b",
+            dirty_files=("other.py",),
+        )
+        self._add_sibling(repo, tmp_path, "codex/clean-c")
+
+        stdout, _ = _run_hook(tmp_path, "http://127.0.0.1:1", cwd=repo)
+        ctx = json.loads(stdout).get("additional_context", "")
+
+        assert "2 sibling worktree(s) carry uncommitted" in ctx
+        assert "codex/clean-c" not in ctx
+        assert "(+1 more)" in ctx
+
+    def test_briefing_surfaces_dirty_detached_sibling(self, tmp_path):
+        repo = self._seed_repo(tmp_path)
+        sibling = self._add_sibling(repo, tmp_path, "codex/detached")
+        _git_q(sibling, "switch", "--detach", "-q")
+        (sibling / "detached work.py").write_text("change\n")
+
+        stdout, _ = _run_hook(tmp_path, "http://127.0.0.1:1", cwd=repo)
+        ctx = json.loads(stdout).get("additional_context", "")
+
+        assert "DETACHED:" in ctx
+        assert "detached work.py" in ctx
+
+    def test_briefing_can_be_disabled(self, tmp_path):
+        repo, _sibling = self._repo_with_sibling(tmp_path, dirty=True)
+        stdout, _ = _run_hook(
+            tmp_path,
+            "http://127.0.0.1:1",
+            cwd=repo,
+            extra_env={"UNITARES_HOOK_SKIP_WORKSPACE_BRIEFING": "1"},
+        )
+        ctx = json.loads(stdout).get("additional_context", "")
+        assert "Workspace coordination" not in ctx

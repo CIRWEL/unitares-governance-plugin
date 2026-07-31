@@ -1,0 +1,8 @@
+{
+  "unitares-governance": {
+    "type": "http",
+    "url": "http://localhost:8767/mcp/",
+    "startup_timeout_sec": 10,
+    "tool_timeout_sec": 60
+  }
+}

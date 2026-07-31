@@ -612,39 +612,71 @@ fi
 # empty briefing and never blocks session start.
 # ---------------------------------------------------------------------------
 WORKSPACE_BRIEFING=""
-if command -v git >/dev/null 2>&1 && git -C "${PWD}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+# Opt out when fleet operators need zero session-start coordination overhead.
+if [ "${UNITARES_HOOK_SKIP_WORKSPACE_BRIEFING:-}" != "1" ] \
+   && command -v git >/dev/null 2>&1 \
+   && git -C "${PWD}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   SELF_WT="$(git -C "${PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
   BRIEF_LINES=""
-  LIVE_COUNT=0
+  DIRTY_COUNT=0
   CUR_WT=""
+  CUR_HEAD=""
+  CUR_BRANCH=""
+
+  _brief_current_worktree() {
+    [ -n "${CUR_WT}" ] || return 0
+
+    # Resolve through git so macOS /var vs /private/var aliases cannot make
+    # this worktree report its own changes as a sibling conflict.
+    _cur_real="$(git -C "${CUR_WT}" rev-parse --show-toplevel 2>/dev/null || echo "${CUR_WT}")"
+    [ "${_cur_real}" != "${SELF_WT}" ] || return 0
+
+    # NUL-delimited porcelain output preserves paths containing whitespace.
+    # --no-renames keeps a uniform three-character status prefix per entry.
+    _files="$(git -C "${CUR_WT}" status --porcelain -z --no-renames 2>/dev/null \
+      | tr '\0' '\n' | sed 's/^...//' | grep -v '^$' || true)"
+    [ -n "${_files}" ] || return 0
+
+    _label="${CUR_BRANCH}"
+    if [ -z "${_label}" ]; then
+      _short_head="$(printf '%s' "${CUR_HEAD}" | cut -c1-12)"
+      _label="DETACHED:${_short_head:-unknown}"
+    fi
+
+    DIRTY_COUNT=$((DIRTY_COUNT + 1))
+    _total="$(printf '%s\n' "${_files}" | grep -c '' || true)"
+    _shown="$(printf '%s\n' "${_files}" | head -3 | paste -sd, - 2>/dev/null || true)"
+    _more=""
+    if [ "${_total}" -gt 3 ] 2>/dev/null; then
+      _more=" (+$((_total - 3)) more)"
+    fi
+    BRIEF_LINES="${BRIEF_LINES}
+  - ${_label} -- uncommitted: ${_shown}${_more}"
+  }
+
   while IFS= read -r _line; do
     case "${_line}" in
       "worktree "*)
         CUR_WT="${_line#worktree }"
         ;;
+      "HEAD "*)
+        CUR_HEAD="${_line#HEAD }"
+        ;;
       "branch refs/heads/"*)
-        _br="${_line#branch refs/heads/}"
-        # Only agent-authored branches count as sibling sessions; skip self,
-        # master, detached cron/backup worktrees.
-        if [ "${CUR_WT}" != "${SELF_WT}" ]; then
-          case "${_br}" in
-            claude/*|codex/*)
-              LIVE_COUNT=$((LIVE_COUNT + 1))
-              _dirty="$(git -C "${CUR_WT}" status --porcelain 2>/dev/null | awk '{print $NF}' | head -3 | paste -sd, - 2>/dev/null)"
-              if [ -n "${_dirty}" ]; then
-                BRIEF_LINES="${BRIEF_LINES}
-  - ${_br} -- uncommitted: ${_dirty}"
-              fi
-              ;;
-          esac
-        fi
+        CUR_BRANCH="${_line#branch refs/heads/}"
+        ;;
+      "")
+        _brief_current_worktree
+        CUR_WT=""
+        CUR_HEAD=""
+        CUR_BRANCH=""
         ;;
     esac
-  done < <(git -C "${PWD}" worktree list --porcelain 2>/dev/null | head -200)
+  done < <({ git -C "${PWD}" worktree list --porcelain 2>/dev/null | head -200 || true; printf '\n'; })
   if [ -n "${BRIEF_LINES}" ]; then
     WORKSPACE_BRIEFING="Workspace coordination (git-sourced -- concurrent worktrees of this repo, NOT governance state):
-${LIVE_COUNT} sibling agent branch(es) are checked out in this repo. The following carry UNCOMMITTED edits that will collide if you touch the same files -- coordinate (or branch from their head) before editing those paths:${BRIEF_LINES}
-This is local git ground truth (adoption-independent). 'Checked out' is not a proven-running process; treat it as a heads-up, not a lock."
+${DIRTY_COUNT} sibling worktree(s) carry uncommitted edits that may overlap if you edit the same files -- coordinate (or branch from their head) before touching these paths:${BRIEF_LINES}
+This is local git ground truth (adoption-independent). Work in separate worktrees conflicts only when the same file is edited, and a dirty worktree may be stale; treat this as a heads-up, not a lock."
   fi
 fi
 

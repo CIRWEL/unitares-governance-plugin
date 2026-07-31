@@ -3,9 +3,30 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Claude Code Plugin](https://img.shields.io/badge/Claude%20Code-plugin-d97757.svg)](https://docs.claude.com/en/docs/claude-code/plugins)
 [![Codex Plugin](https://img.shields.io/badge/Codex-plugin-10a37f.svg)](./CODEX_START.md)
-[![Version](https://img.shields.io/badge/version-0.4.9-blue.svg)](.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.4.10-blue.svg)](.claude-plugin/plugin.json)
 
 Client/plugin integration layer for **UNITARES** — the runtime governance layer for heterogeneous AI-agent fleets. This repo provides Claude/Codex-facing skills, command guidance, hook scripts, and sidecar tooling for connecting coding agents to a running UNITARES governance server. The runtime itself lives in [`cirwel/unitares`](https://github.com/cirwel/unitares); Hermes-native lifecycle bindings live in [`cirwel/unitares-host-adapter`](https://github.com/cirwel/unitares-host-adapter).
+
+## Install With Claude Code
+
+This repository is a Claude Code plugin marketplace. Add the marketplace, then
+install the plugin:
+
+```text
+/plugin marketplace add cirwel/unitares-governance-plugin
+/plugin install unitares-governance@unitares-governance
+```
+
+The plugin ships an `.mcp.json` file that registers its governance MCP client.
+No hand-edited `mcpServers` JSON is required. A UNITARES server must still be
+reachable at `http://localhost:8767`, or at the base URL configured through
+`UNITARES_SERVER_URL`; see [Prerequisites](#prerequisites). Codex and ChatGPT
+users should start with [CODEX_START.md](./CODEX_START.md).
+
+For Codex CLI, add the marketplace with
+`codex plugin marketplace add cirwel/unitares-governance-plugin`, install the
+plugin from `/plugins`, and start a new session. Review the bundled lifecycle
+commands in `/hooks`; Codex does not run untrusted plugin hooks automatically.
 
 ## Purpose
 
@@ -202,13 +223,18 @@ known token-auth limitation, and plugin-cache upgrade steps, see
 
 ## Development Workflow
 
-Use a lightweight branch and PR flow for normal changes:
+Every change uses a fresh short-lived branch and pull request:
 
 1. create a short-lived branch
 2. keep the change focused
 3. push the branch
-4. open a PR
+4. run the pre-PR gate and open a draft PR
 5. merge after review or self-review
+
+Do not push directly to `master`, reuse a branch whose PR is merged or closed,
+or append post-merge fixes to an old PR head. `scripts/dev/ship.sh` creates a
+fresh branch from an up-to-date default branch, refuses delivered PR heads,
+and opens a draft PR for staged, otherwise-clean changes.
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for the repo convention.
 

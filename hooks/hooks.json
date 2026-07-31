@@ -12,7 +12,7 @@
         ]
       },
       {
-        "matcher": "mcp__.*__(process_agent_update|sync_state|get_governance_metrics|check_working_state|outcome_event|record_result|knowledge|search_shared_memory|leave_note|dialectic|request_review|observe|calibration|export|config|agent|self_recovery|archive_orphan_agents|list_tools|describe_tool|health_check)",
+        "matcher": "mcp__.*__(onboard|start_session|process_agent_update|sync_state|get_governance_metrics|check_working_state|outcome_event|record_result|knowledge|search_shared_memory|leave_note|dialectic|request_review|observe|calibration|export|config|agent|self_recovery|archive_orphan_agents|list_tools|describe_tool|health_check)",
         "hooks": [
           {
             "type": "command",
