@@ -1,9 +1,8 @@
-"""Contract test: SessionEnd hook emits a session_end check-in."""
+"""Contract test: SessionEnd stays within Claude's local cleanup budget."""
 
 from __future__ import annotations
 
 import json
-import socketserver
 import subprocess
 import sys
 import threading
@@ -18,8 +17,7 @@ from _session_lookup import _slot_filename  # noqa: E402
 from tests.test_session_start_checkin import RecordingHandler, _ReusableTCPServer  # noqa: E402
 
 
-def test_session_end_emits_checkin(tmp_path):
-    """session-end hook posts a check-in with event='session_end'."""
+def test_session_end_does_not_attempt_governance_delivery(tmp_path):
     RecordingHandler.calls = []
     srv = _ReusableTCPServer(("127.0.0.1", 0), RecordingHandler)
     port = srv.server_address[1]
@@ -62,19 +60,4 @@ def test_session_end_emits_checkin(tmp_path):
         srv.shutdown()
         thread.join(timeout=2)
 
-    events = [
-        c["arguments"]["metadata"]["event"]
-        for c in RecordingHandler.calls
-        if c.get("name") == "process_agent_update"
-    ]
-    assert "session_end" in events
-    payloads = [
-        c["arguments"]
-        for c in RecordingHandler.calls
-        if c.get("name") == "process_agent_update"
-    ]
-    assert all("continuity_token" not in args for args in payloads)
-    assert all(
-        args["epistemic_class"] == "substrate_interpretation"
-        for args in payloads
-    )
+    assert RecordingHandler.calls == []

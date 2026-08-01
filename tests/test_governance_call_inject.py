@@ -30,9 +30,12 @@ def _write_cache(workspace: Path, slot: str = SLOT, sid: str = SID) -> None:
     }))
 
 
-def _run(hook_input: dict, workspace: Path):
+def _run(hook_input: dict, workspace: Path, *, host: str | None = None):
+    command = [str(HOOK)]
+    if host is not None:
+        command.extend(("--host", host))
     return subprocess.run(
-        [str(HOOK)],
+        command,
         input=json.dumps(hook_input),
         text=True,
         capture_output=True,
@@ -84,6 +87,13 @@ class TestInjection:
         assert updated is not None
         assert updated["client_session_id"] == SID
 
+    def test_injects_for_legacy_unitares_server_alias(self, tmp_path):
+        _write_cache(tmp_path)
+        result = _run(_hook_input("mcp__UNITARES__sync_state", {}), tmp_path)
+        updated = _updated_input(result)
+        assert updated is not None
+        assert updated["client_session_id"] == SID
+
     def test_injects_for_gateway_server_name(self, tmp_path):
         _write_cache(tmp_path)
         result = _run(_hook_input("mcp__claude_ai_UNITARES__knowledge", {"action": "search"}), tmp_path)
@@ -92,12 +102,48 @@ class TestInjection:
         assert updated["client_session_id"] == SID
         assert updated["action"] == "search"
 
+    def test_injects_for_native_claude_plugin_scoped_server(self, tmp_path):
+        _write_cache(tmp_path)
+        result = _run(
+            _hook_input(
+                "mcp__plugin_unitares-governance_unitares-governance__sync_state",
+                {},
+            ),
+            tmp_path,
+            host="claude",
+        )
+        updated = _updated_input(result)
+        assert updated is not None
+        assert updated["client_session_id"] == SID
+
     def test_no_permission_decision_emitted(self, tmp_path):
         _write_cache(tmp_path)
         result = _run(_hook_input(
             "mcp__unitares-governance__process_agent_update", {}), tmp_path)
         payload = json.loads(result.stdout.strip())
         assert "permissionDecision" not in payload["hookSpecificOutput"]
+
+    def test_codex_rewrite_includes_required_allow_decision(self, tmp_path):
+        _write_cache(tmp_path)
+        result = _run(
+            _hook_input("mcp__unitares-governance__sync_state", {}),
+            tmp_path,
+            host="codex",
+        )
+        payload = json.loads(result.stdout.strip())["hookSpecificOutput"]
+        assert payload["permissionDecision"] == "allow"
+        assert payload["updatedInput"]["client_session_id"] == SID
+
+    def test_codex_legacy_alias_is_not_rewritten_or_preapproved(self, tmp_path):
+        _write_cache(tmp_path)
+        result = _run(
+            _hook_input("mcp__governance__sync_state", {}),
+            tmp_path,
+            host="codex",
+        )
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == ""
 
 
 class TestTagNormalization:
@@ -171,6 +217,7 @@ class TestAnchoredMintingTools:
         # bare start_session() resumes through the per-thread anchor instead
         # of falling back to server-side pin/name heuristics.
         monkeypatch.setenv("UNITARES_CLIENT_SESSION_ID", "agent:/thread-123")
+        monkeypatch.setenv("UNITARES_ORCHESTRATED", "1")
         result = _run(_hook_input(
             "mcp__unitares-governance__start_session", {}), tmp_path)
         updated = _updated_input(result)
@@ -179,6 +226,7 @@ class TestAnchoredMintingTools:
 
     def test_anchored_onboard_without_force_new_injects_env_anchor(self, tmp_path, monkeypatch):
         monkeypatch.setenv("UNITARES_CLIENT_SESSION_ID", "agent:/thread-123")
+        monkeypatch.setenv("UNITARES_ORCHESTRATED", "yes")
         result = _run(_hook_input(
             "mcp__unitares-governance__onboard", {"name": "claude-thread"}), tmp_path)
         updated = _updated_input(result)
@@ -190,6 +238,16 @@ class TestAnchoredMintingTools:
         monkeypatch.delenv("UNITARES_CLIENT_SESSION_ID", raising=False)
         result = _run(_hook_input(
             "mcp__unitares-governance__start_session", {}), tmp_path)
+        assert result.stdout.strip() == ""
+
+    def test_leaked_anchor_without_orchestration_marker_stays_bare(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("UNITARES_CLIENT_SESSION_ID", "agent:/leaked-anchor")
+        monkeypatch.delenv("UNITARES_ORCHESTRATED", raising=False)
+        result = _run(
+            _hook_input("mcp__unitares-governance__start_session", {}),
+            tmp_path,
+            host="codex",
+        )
         assert result.stdout.strip() == ""
 
     def test_explicit_force_new_blocks_anchor_injection(self, tmp_path, monkeypatch):
@@ -214,6 +272,15 @@ class TestAnchoredMintingTools:
 
 
 class TestExclusions:
+
+    def test_codex_does_not_rewrite_admin_capable_tool(self, tmp_path):
+        _write_cache(tmp_path)
+        result = _run(
+            _hook_input("mcp__governance__config", {"action": "get"}),
+            tmp_path,
+            host="codex",
+        )
+        assert result.stdout.strip() == ""
 
     def test_never_injects_into_onboard(self, tmp_path):
         # Explicit force_new keeps its fresh-mint semantics even when the
@@ -248,6 +315,15 @@ class TestExclusions:
     def test_skips_non_unitares_server(self, tmp_path):
         _write_cache(tmp_path)
         result = _run(_hook_input("mcp__GitHub__agent", {}), tmp_path)
+        assert result.stdout.strip() == ""
+
+    def test_codex_skips_unitares_lookalike_without_preapproval(self, tmp_path):
+        _write_cache(tmp_path)
+        result = _run(
+            _hook_input("mcp__evil-unitares-proxy__sync_state", {}),
+            tmp_path,
+            host="codex",
+        )
         assert result.stdout.strip() == ""
 
     def test_skips_non_mcp_tool(self, tmp_path):

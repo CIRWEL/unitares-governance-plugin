@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,6 +33,7 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from onboard_helper import run_onboard, unwrap_tool_response  # noqa: E402
+from _http_auth import authorization_safe_urlopen  # noqa: E402
 
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:8767"
@@ -193,7 +194,7 @@ def _post_tool(
         headers["Authorization"] = f"Bearer {auth_token}"
     req = Request(url, data=body, headers=headers, method="POST")
     try:
-        with urlopen(req, timeout=timeout) as resp:
+        with authorization_safe_urlopen(req, timeout=timeout) as resp:
             raw = json.loads(resp.read().decode("utf-8"))
     except HTTPError as exc:
         try:

@@ -1,0 +1,2 @@
+# Keep the hook package LF; its Bash entrypoints include the Windows polyglot wrapper.
+hooks/* text eol=lf

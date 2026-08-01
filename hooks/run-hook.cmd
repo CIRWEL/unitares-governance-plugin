@@ -1,5 +1,6 @@
 : << 'CMDBLOCK'
 @echo off
+setlocal EnableDelayedExpansion
 REM Cross-platform polyglot wrapper for hook scripts.
 if "%~1"=="" (
     echo run-hook.cmd: missing script name >&2
@@ -8,17 +9,27 @@ if "%~1"=="" (
 set "HOOK_DIR=%~dp0"
 if exist "C:\Program Files\Git\bin\bash.exe" (
     "C:\Program Files\Git\bin\bash.exe" "%HOOK_DIR%%~1" %2 %3 %4 %5 %6 %7 %8 %9
-    exit /b %ERRORLEVEL%
+    exit /b !ERRORLEVEL!
 )
 if exist "C:\Program Files (x86)\Git\bin\bash.exe" (
     "C:\Program Files (x86)\Git\bin\bash.exe" "%HOOK_DIR%%~1" %2 %3 %4 %5 %6 %7 %8 %9
-    exit /b %ERRORLEVEL%
+    exit /b !ERRORLEVEL!
 )
 where bash >nul 2>nul
-if %ERRORLEVEL% equ 0 (
+if !ERRORLEVEL! equ 0 (
     bash "%HOOK_DIR%%~1" %2 %3 %4 %5 %6 %7 %8 %9
-    exit /b %ERRORLEVEL%
+    exit /b !ERRORLEVEL!
 )
+echo run-hook.cmd: Git Bash is required to run UNITARES hooks >&2
+if /I "%~1"=="pre-edit" (
+    if /I "%UNITARES_FILE_LEASES_REQUIRED%"=="1" goto required_lease_bash
+    if /I "%UNITARES_FILE_LEASES_REQUIRED%"=="true" goto required_lease_bash
+    if /I "%UNITARES_FILE_LEASES_REQUIRED%"=="on" goto required_lease_bash
+    if /I "%UNITARES_FILE_LEASES_REQUIRED%"=="yes" goto required_lease_bash
+)
+exit /b 1
+:required_lease_bash
+echo {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"UNITARES required file leases need Git Bash on Windows."}}
 exit /b 0
 CMDBLOCK
 

@@ -1,6 +1,6 @@
 # Check-In Triggers
 
-The Claude adapter emits canonical `process_agent_update` calls at three trigger points.
+The Claude adapter emits canonical `process_agent_update` calls at two trigger points.
 `session-start` is deliberately read-only: it checks server reachability,
 fetches the governance fundamentals excerpt, and prompts the agent to call
 `start_session(force_new=true)` / `onboard(force_new=true)` itself only when no
@@ -14,13 +14,18 @@ observation instead. Once a process is bound, later turns continue via
 |---|---|---|---|
 | Claude turn ends | `post-stop` | per Claude turn | `turn_stop` |
 | Edit threshold crossed | `post-edit` | every N edits or T seconds | `auto_edit` |
-| Session closes | `session-end` | once per session | `session_end` |
 
 All emissions share one shared helper (`scripts/checkin.py`) that:
 - Applies secret-pattern redaction to `response_text` before POST
 - Truncates `response_text` to 512 chars
 - Logs one status line per attempt to `~/.unitares/checkins.log`
 - Returns fire-and-forget: never raises, never blocks a Claude turn on failure
+
+`session-end` is deliberately not a third network trigger. Claude gives
+plugin-provided SessionEnd hooks a shared 1.5-second budget, so that hook only
+attempts bounded lease cleanup. The preceding `post-stop` call owns final
+governance delivery; an abrupt shutdown can leave a lease only until its short
+TTL expires.
 
 ## Kill switch
 
@@ -84,12 +89,38 @@ Live mode writes a unique canary identity. It asserts the full boundary: a bare
 `agent:/thread-*` resume miss returns `lineage_declaration_required`, while
 `orchestrated=true` first-binds and a second turn resumes the same UUID.
 
-## Known limitation
+## HTTP authentication
 
-The edit-threshold auto-checkin previously supported `UNITARES_HTTP_API_TOKEN`
-for Bearer-token auth against remote governance. The refactored helper uses
-stdlib urllib and does not pass this header. Local-only deployments (the
-supported default) are unaffected.
+Set `UNITARES_HTTP_API_TOKEN` when the governance REST surface requires a
+Bearer token. Check-ins, skill fetches, onboarding, the identity sidecar, and
+identity-free floor observations forward the non-empty value in the
+`Authorization` header. The bundled Claude MCP transport expands the same value
+in its `headers` map. Current Claude hook payloads identify that plugin server as
+`plugin_unitares-governance_unitares-governance`; Codex hook payloads use the
+bare `unitares-governance` alias.
+
+The bundled Codex transport is deliberately unauthenticated localhost and has
+no `bearer_token_env_var`. For hosted or authenticated governance, disable the
+bundled entry and add a separate authenticated server under the exact bare
+alias:
+
+```toml
+# ~/.codex/config.toml
+[plugins."unitares-governance@unitares-governance".mcp_servers.unitares-governance]
+enabled = false
+```
+
+```bash
+codex mcp add unitares-governance \
+  --url "${UNITARES_SERVER_URL%/}/mcp/" \
+  --bearer-token-env-var UNITARES_HTTP_API_TOKEN
+```
+
+For hosted governance, set the client variable to one token accepted by the
+server's `UNITARES_MCP_BEARER_TOKENS` allowlist; do not expose the full
+server-side allowlist to clients. Leaving the variable unset preserves the
+unauthenticated local behavior for REST helpers and Claude; it is also the
+expected state for Codex's bundled localhost transport.
 
 ## Upgrading from plugin 0.2.0
 

@@ -1,54 +1,33 @@
 #!/usr/bin/env bash
 # UNITARES Governance Plugin — SessionEnd hook
 #
-# Fires when the Claude Code session terminates (window close, etc).
-# Posts a final session_end check-in. Synchronous — session may be
-# closing abruptly, and we want the POST to land before the process
-# exits. 20s POST timeout in checkin.py bounds the wait. `|| true`
-# ensures failure doesn't propagate.
+# Fires when the host session terminates (window close, etc). Both hosts use
+# this only for bounded local lease cleanup. Claude gives plugin-provided
+# SessionEnd hooks a shared 1.5-second budget that a manifest timeout cannot
+# raise, so turn-level governance delivery belongs to Stop instead.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+HOOK_HOST="claude"
+if [[ "${1:-}" == "--host" && -n "${2:-}" ]]; then
+  HOOK_HOST="$2"
+fi
+if [[ "${HOOK_HOST}" != "claude" && "${HOOK_HOST}" != "codex" ]]; then
+  exit 0
+fi
+
 PAYLOAD=$(cat 2>/dev/null || echo "{}")
 [[ -z "${PAYLOAD}" ]] && PAYLOAD="{}"
 
-# Resolve slot-aware session cache via shared helper.
-SESSION_LOOKUP="${PLUGIN_ROOT}/scripts/_session_lookup.py"
-if [[ ! -f "${SESSION_LOOKUP}" ]]; then
-  exit 0
-fi
-eval "$(printf '%s' "${PAYLOAD}" | python3 "${SESSION_LOOKUP}" --workspace "${PWD}")"
-
-# Release any file leases held by this Claude session. Run this before the
-# check-in credential guard so a session that edited before onboarding still
-# cleans up its lease-plane state.
+# Release any file leases held by this host session. Run this before the
+# deadline expires; PostToolUse and Stop are the primary release paths, while
+# TTL remains the crash backstop.
 FILE_LEASE_HELPER="${PLUGIN_ROOT}/scripts/file_lease_hook.py"
 if [[ -f "${FILE_LEASE_HELPER}" ]]; then
-  printf '%s' "${PAYLOAD}" | python3 "${FILE_LEASE_HELPER}" release-session --workspace "${PWD}" >/dev/null 2>&1 || true
+  printf '%s' "${PAYLOAD}" | python3 "${FILE_LEASE_HELPER}" release-session \
+    --workspace "${PWD}" --host "${HOOK_HOST}" --budget 0.8 >/dev/null 2>&1 || true
 fi
-
-[[ -z "${CSID:-}" ]] && exit 0
-
-# Tally check-ins posted this session from the log (best effort).
-LOG="${UNITARES_CHECKIN_LOG:-${HOME}/.unitares/checkins.log}"
-COUNT=0
-if [[ -f "${LOG}" ]]; then
-  COUNT=$(grep -c "slot=${SLOT}" "${LOG}" 2>/dev/null || printf 0)
-fi
-
-SUMMARY="Session ended: ${COUNT} check-ins posted this session"
-
-python3 "${PLUGIN_ROOT}/scripts/checkin.py" \
-  --event session_end \
-  --response-text "${SUMMARY}" \
-  --complexity 0.1 \
-  --confidence 0.9 \
-  --epistemic-class substrate_interpretation \
-  --client-session-id "${CSID}" \
-  --uuid "${UUID}" \
-  --slot "${SLOT}" \
-  >/dev/null 2>&1 || true
 
 exit 0

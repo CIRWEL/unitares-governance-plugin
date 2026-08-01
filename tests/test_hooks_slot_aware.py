@@ -1,4 +1,4 @@
-"""Regression test: post-stop, session-end, and post-edit all find the
+"""Regression test: post-stop and post-edit both find the
 slotted session cache when Claude Code passes a session_id on stdin.
 
 Before commit that introduces scripts/_session_lookup.py, these hooks
@@ -139,7 +139,7 @@ def test_post_stop_orchestrated_anchor_resumes(tmp_path):
     assert "#" not in args["name"]
 
 
-def test_session_end_reads_slotted_cache(tmp_path):
+def test_session_end_does_not_duplicate_stop_checkin(tmp_path):
     slot = "real-slot-5678"
     _seed_slotted_cache(tmp_path, slot, {
         "uuid": "86ae619f-87e0-4040-8f29-eacece0c7904",
@@ -148,18 +148,7 @@ def test_session_end_reads_slotted_cache(tmp_path):
         "slot": slot,
     })
     checkins = _run_hook_with_mock_server("session-end", tmp_path, slot)
-    events = [c["arguments"]["metadata"]["event"] for c in checkins]
-    assert "session_end" in events
-
-    # Fix I1 regression: response_text must not contain a newline.
-    session_end_checkins = [
-        c for c in checkins
-        if c["arguments"]["metadata"]["event"] == "session_end"
-    ]
-    assert session_end_checkins, "no session_end check-in found"
-    text = session_end_checkins[0]["arguments"]["response_text"]
-    assert "\n" not in text, f"response_text contains newline: {text!r}"
-    assert "check-ins posted" in text
+    assert checkins == []
 
 
 def test_post_edit_reads_slotted_cache(tmp_path):

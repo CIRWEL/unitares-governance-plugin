@@ -76,6 +76,10 @@ Before opening or merging a PR, check:
 - skills do not point at stale server paths
 - hooks do not create noisy or misleading governance behavior
 - Claude and Codex manifests each point at host-compatible MCP and hook files
+- host-dependent hook commands select a host explicitly, with payload fixtures
+  covering that host's edit and Stop wire formats
+- synchronous Codex PostToolUse hooks remain bounded and do not make edit-level
+  governance check-ins
 
 Run the full local suite before delivery:
 

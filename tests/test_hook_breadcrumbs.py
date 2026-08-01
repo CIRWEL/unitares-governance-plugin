@@ -21,6 +21,7 @@ from pathlib import Path
 PLUGIN_ROOT = Path(__file__).parent.parent
 POST_IDENTITY = PLUGIN_ROOT / "hooks" / "post-identity"
 POST_EDIT = PLUGIN_ROOT / "hooks" / "post-edit"
+PRE_GOVERNANCE = PLUGIN_ROOT / "hooks" / "pre-governance-call"
 
 
 def _run(hook: Path, hook_input: dict, workspace: Path, debug_log: Path):
@@ -119,9 +120,11 @@ class TestPostIdentityBreadcrumbs:
         }
         hook_input = {
             "session_id": "slot-happy",
+            "tool_use_id": "toolu_happy_identity",
             "tool_name": "mcp__unitares-governance__onboard",
             "tool_response": [{"type": "text", "text": json.dumps(inner)}],
         }
+        assert _run(PRE_GOVERNANCE, hook_input, tmp_path, log).returncode == 0
         result = _run(POST_IDENTITY, hook_input, tmp_path, log)
         assert result.returncode == 0
         contents = log.read_text() if log.exists() else ""

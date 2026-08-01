@@ -43,6 +43,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Optional
 
+from _http_auth import authorization_safe_urlopen, governance_json_headers
+
 DEFAULT_SERVER_URL = "http://localhost:8767"
 DEFAULT_CACHE_DIR = "~/.unitares/skills-cache"
 # Session-start fires often (every Claude Code resume); fetching every
@@ -174,10 +176,10 @@ def _fetch_from_server(
     req = urllib.request.Request(
         f"{server_url}/v1/tools/call",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers=governance_json_headers(),
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with authorization_safe_urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8")
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         _crumb("HTTP_ERROR", f"{type(exc).__name__}: {exc}")
