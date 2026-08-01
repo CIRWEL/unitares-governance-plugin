@@ -15,7 +15,7 @@
 # in the slot-scoped session cache, not the legacy flat session.json — flat
 # writes silently brick the auto-checkin forcing function (post-edit reads
 # the slotted cache via _session_lookup, which the post-PR-19 contract
-# scopes to slot-only). The slot is strictly the Claude Code session_id
+# scopes to slot-only). The slot is strictly the host session_id
 # from hook stdin; cache-stored `slot` fields are not consulted as a
 # fallback because a stale legacy flat cache may carry a slot value from a
 # prior unrelated session. When stdin lacks session_id (manual invocation,
@@ -23,12 +23,21 @@
 # stderr and is a full no-op — three ontologically distinct states (success,
 # crash, deliberate skip) are kept legible per axiom #14.
 #
-# Runs async — must never block or produce output on failure (stderr
-# breadcrumb is the documented exception; harness logs it without blocking).
+# Claude runs this asynchronously; Codex runs it synchronously with a five-
+# second outer timeout. Work here is local and bounded. Neither path produces
+# output on failure (stderr slotless breadcrumb is the documented exception).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+HOOK_HOST="claude"
+if [[ "${1:-}" == "--host" && -n "${2:-}" ]]; then
+  HOOK_HOST="$2"
+fi
+if [[ "${HOOK_HOST}" != "claude" && "${HOOK_HOST}" != "codex" ]]; then
+  exit 0
+fi
 
 SESSION_CACHE_HELPER=""
 for candidate in \
@@ -47,11 +56,39 @@ fi
 
 SLOT_HELPER="${PLUGIN_ROOT}/scripts/_slot_from_stdin.py"
 
-# Capture hook stdin (Claude Code passes tool event as JSON, including session_id).
+# Capture hook stdin (both hosts pass tool event JSON, including session_id).
 HOOK_INPUT=""
 if [[ ! -t 0 ]]; then
   HOOK_INPUT=$(cat 2>/dev/null) || true
 fi
+
+# Hook matchers are intentionally broad enough to cover every configured MCP
+# alias. Enforce exact server ownership before any snapshot discard, milestone
+# reset, or session stamp so a same-named tool on another server is inert.
+IS_GOVERNANCE_CHECKIN=$(python3 - "${HOOK_INPUT}" "${PLUGIN_ROOT}/scripts" "${HOOK_HOST}" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+sys.path.insert(0, sys.argv[2])
+
+from governance_tool_name import is_governance_tool
+
+try:
+    payload = json.loads(sys.argv[1])
+except Exception:
+    payload = {}
+print(
+    "1"
+    if is_governance_tool(
+        payload.get("tool_name"),
+        host=sys.argv[3],
+        suffixes={"process_agent_update", "sync_state"},
+    )
+    else "0"
+)
+PY
+)
+[[ "${IS_GOVERNANCE_CHECKIN}" == "1" ]] || exit 0
 
 # Derive slot strictly from stdin session_id via the shared helper.
 SLOT=""
@@ -69,18 +106,96 @@ if [[ -z "${SLOT}" ]]; then
   exit 0
 fi
 
-# Only act when we already have a governance session cached for this slot —
-# this hook is tool-scoped so we shouldn't see an empty cache in practice,
-# but guarding makes the hook safe to install in workspaces that never
-# onboarded.
-SESSION_PAYLOAD=$(python3 "${SESSION_CACHE_HELPER}" get session --workspace "${PWD}" --slot "${SLOT}" 2>/dev/null || echo "{}")
-if [[ -z "${SESSION_PAYLOAD}" || "${SESSION_PAYLOAD}" == "{}" ]]; then
+# Prefer the PreToolUse snapshot keyed by this invocation. Payloads without a
+# tool id retain the legacy immediate compare-and-reset fallback.
+TOOL_USE_ID=$(python3 - "${HOOK_INPUT}" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+try:
+    payload = json.loads(sys.argv[1])
+except Exception:
+    payload = {}
+print(str(payload.get("tool_use_id") or payload.get("tool_call_id") or ""))
+PY
+)
+
+# PostToolUse also fires for failed MCP calls. Only an explicit successful
+# UNITARES response acknowledges pending edits; missing, malformed, isError,
+# or success=false results preserve the milestone and its timestamp.
+CHECKIN_SUCCEEDED=$(python3 - "${HOOK_INPUT}" "${HOOK_HOST}" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+try:
+    payload = json.loads(sys.argv[1])
+except Exception:
+    payload = {}
+
+
+def explicit_success(value, depth=0):
+    if depth > 4:
+        return None
+    if isinstance(value, list):
+        verdicts = [explicit_success(part, depth + 1) for part in value]
+        if False in verdicts:
+            return False
+        return True if True in verdicts else None
+    if not isinstance(value, dict):
+        return None
+    if value.get("isError") is True:
+        return False
+    current = value.get("success")
+    if current is False:
+        return False
+    nested = [
+        explicit_success(value[key], depth + 1)
+        for key in ("structuredContent", "result", "content")
+        if key in value
+    ]
+    text = value.get("text")
+    if isinstance(text, str):
+        try:
+            nested.append(explicit_success(json.loads(text), depth + 1))
+        except Exception:
+            pass
+    if False in nested:
+        return False
+    if current is True or True in nested:
+        return True
+    return None
+
+
+print("1" if explicit_success(payload.get("tool_response")) is True else "0")
+PY
+)
+if [[ "${CHECKIN_SUCCEEDED}" != "1" ]]; then
+  if [[ -n "${TOOL_USE_ID}" ]]; then
+    python3 "${SESSION_CACHE_HELPER}" discard-milestone-snapshot \
+      --workspace "${PWD}" \
+      --event-id "${TOOL_USE_ID}" >/dev/null 2>&1 || true
+  fi
   exit 0
 fi
 
-python3 "${SESSION_CACHE_HELPER}" \
-  reset-milestone \
-  --workspace "${PWD}" >/dev/null 2>&1 || true
+# A successful call without an addressable local identity cannot safely stamp
+# a session or acknowledge the workspace milestone. Discard only its temporary
+# snapshot so the pending edits remain visible to a later bound check-in.
+SESSION_PAYLOAD=$(python3 "${SESSION_CACHE_HELPER}" get session --workspace "${PWD}" --slot "${SLOT}" 2>/dev/null || echo "{}")
+if [[ -z "${SESSION_PAYLOAD}" || "${SESSION_PAYLOAD}" == "{}" ]]; then
+  if [[ -n "${TOOL_USE_ID}" ]]; then
+    python3 "${SESSION_CACHE_HELPER}" discard-milestone-snapshot \
+      --workspace "${PWD}" \
+      --event-id "${TOOL_USE_ID}" >/dev/null 2>&1 || true
+  fi
+  exit 0
+fi
+
+if [[ -n "${TOOL_USE_ID}" ]]; then
+  python3 "${SESSION_CACHE_HELPER}" reset-milestone \
+    --workspace "${PWD}" \
+    --snapshot-id "${TOOL_USE_ID}" >/dev/null 2>&1 || true
+fi
 
 NOW_EPOCH=$(python3 -c "import time; print(int(time.time()))" 2>/dev/null || echo "")
 if [[ -n "${NOW_EPOCH}" ]]; then

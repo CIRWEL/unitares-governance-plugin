@@ -11,8 +11,6 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 SCRIPTS = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
@@ -70,9 +68,10 @@ def test_post_failure_returns_floor_fail():
     assert result == "floor_fail"
 
 
-def test_post_targets_observe_endpoint():
+def test_post_targets_observe_endpoint_with_http_api_token(monkeypatch):
     """_post must hit /v1/substrate/observe, never /v1/tools/call."""
     seen = {}
+    monkeypatch.setenv("UNITARES_HTTP_API_TOKEN", "floor-secret")
 
     class _Resp:
         def __enter__(self):
@@ -86,13 +85,18 @@ def test_post_targets_observe_endpoint():
 
     def fake_urlopen(req, timeout=5.0):
         seen["full_url"] = req.full_url
+        seen["headers"] = {
+            key.lower(): value for key, value in req.header_items()
+        }
         return _Resp()
 
-    with patch("substrate_floor.urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("substrate_floor.authorization_safe_urlopen", side_effect=fake_urlopen):
         ok, _latency, err = substrate_floor._post("http://localhost:8767", {"slot_key": "s"})
     assert ok is True
     assert err is None
     assert seen["full_url"].endswith("/v1/substrate/observe")
+    assert seen["headers"]["authorization"] == "Bearer floor-secret"
+    assert seen["headers"]["content-type"] == "application/json"
 
 
 def test_session_lookup_emits_raw_slot():

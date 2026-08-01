@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Claude PostToolBatch cleanup for exact, completed edit tool calls.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+HOOK_HOST="claude"
+if [[ "${1:-}" == "--host" && -n "${2:-}" ]]; then
+  HOOK_HOST="$2"
+fi
+[[ "${HOOK_HOST}" == "claude" ]] || exit 0
+
+for candidate in \
+  "${PLUGIN_ROOT}/config/defaults.env" \
+  "${PLUGIN_ROOT}/config/client/defaults.env"
+do
+  if [[ -f "${candidate}" ]]; then
+    # shellcheck source=/dev/null
+    source "${candidate}" 2>/dev/null || true
+    break
+  fi
+done
+
+HOOK_INPUT=""
+if [[ ! -t 0 ]]; then
+  HOOK_INPUT=$(cat 2>/dev/null) || true
+fi
+
+HELPER="${PLUGIN_ROOT}/scripts/file_lease_hook.py"
+if [[ -f "${HELPER}" ]]; then
+  printf '%s' "${HOOK_INPUT}" | python3 "${HELPER}" release-batch \
+    --workspace "${PWD}" --host claude >/dev/null 2>&1 || true
+fi
+
+exit 0

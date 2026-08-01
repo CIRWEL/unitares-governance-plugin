@@ -1,0 +1,20 @@
+{
+  "name": "unitares-governance",
+  "interface": {
+    "displayName": "UNITARES Governance"
+  },
+  "plugins": [
+    {
+      "name": "unitares-governance",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

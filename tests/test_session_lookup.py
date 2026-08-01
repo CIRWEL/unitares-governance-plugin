@@ -7,6 +7,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from _session_lookup import (
@@ -25,6 +27,15 @@ def test_slot_filename_matches_onboard_helper():
     assert _slot_filename("") == onboard_slot_filename("")
 
 
+def _write_invalid_authority(home: Path, slot: str) -> None:
+    path = home / ".unitares-cache-authority" / _slot_filename(slot)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"schema_version": 1, "generation": 7, "mirror_valid": False}),
+        encoding="utf-8",
+    )
+
+
 def test_extract_slot_handles_missing_payload():
     assert _extract_slot("") is None
     assert _extract_slot("{}") is None
@@ -33,6 +44,45 @@ def test_extract_slot_handles_missing_payload():
 
 def test_extract_slot_reads_session_id():
     assert _extract_slot('{"session_id":"abc-123"}') == "abc-123"
+
+
+def test_workspace_equal_to_home_still_honors_invalid_mirror_authority(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    slot = "invalid-home-primary"
+    cache = home / ".unitares" / _slot_filename(slot)
+    cache.parent.mkdir(parents=True)
+    cache.write_text('{"uuid": "stale"}', encoding="utf-8")
+    _write_invalid_authority(home, slot)
+    monkeypatch.setenv("HOME", str(home))
+
+    assert resolve_session_file(home, slot) is None
+
+
+def test_symlinked_home_cache_uses_authority_from_raw_home_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    mirror_target = tmp_path / "mirror-target"
+    other_workspace = tmp_path / "other"
+    home.mkdir()
+    mirror_target.mkdir()
+    try:
+        (home / ".unitares").symlink_to(mirror_target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    slot = "symlinked-authority"
+    (mirror_target / _slot_filename(slot)).write_text(
+        '{"uuid": "stale"}',
+        encoding="utf-8",
+    )
+    _write_invalid_authority(home, slot)
+    monkeypatch.setenv("HOME", str(home))
+
+    assert resolve_session_file(other_workspace, slot) is None
 
 
 def test_extract_slot_uses_codex_transcript_fallback():

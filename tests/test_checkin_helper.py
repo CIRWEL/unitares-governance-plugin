@@ -3,17 +3,79 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 import checkin  # noqa: E402
+
+
+class _HTTPResponse:
+    def __init__(self, payload: object):
+        self.body = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self.body
+
+
+def test_http_200_inner_rejection_is_not_delivery():
+    response = {
+        "success": True,
+        "name": "process_agent_update",
+        "result": {"success": False, "error": "governance rejected update"},
+    }
+    with patch("checkin.authorization_safe_urlopen", return_value=_HTTPResponse(response)):
+        ok, _latency_ms, error = checkin._post_to_governance(
+            "http://governance.test",
+            {"name": "process_agent_update", "arguments": {}},
+        )
+
+    assert ok is False
+    assert error == "governance rejected update"
+
+
+def test_http_200_requires_parseable_success_confirmation():
+    class InvalidResponse(_HTTPResponse):
+        def __init__(self):
+            self.body = b"not-json"
+
+    with patch("checkin.authorization_safe_urlopen", return_value=InvalidResponse()):
+        ok, _latency_ms, error = checkin._post_to_governance(
+            "http://governance.test",
+            {"name": "process_agent_update", "arguments": {}},
+        )
+
+    assert ok is False
+    assert error and error.startswith("invalid governance response:")
+
+
+def test_governance_post_forwards_http_api_token(monkeypatch):
+    monkeypatch.setenv("UNITARES_HTTP_API_TOKEN", "checkin-secret")
+    response = _HTTPResponse({"success": True})
+
+    with patch(
+        "checkin.authorization_safe_urlopen", return_value=response
+    ) as mock_urlopen:
+        ok, _latency_ms, error = checkin._post_to_governance(
+            "http://governance.test",
+            {"name": "process_agent_update", "arguments": {}},
+        )
+
+    request = mock_urlopen.call_args.args[0]
+    headers = {key.lower(): value for key, value in request.header_items()}
+    assert headers["authorization"] == "Bearer checkin-secret"
+    assert headers["content-type"] == "application/json"
+    assert ok is True
+    assert error is None
 
 
 def test_kill_switch_skips_post(monkeypatch, tmp_path):
@@ -41,6 +103,31 @@ def test_kill_switch_skips_post(monkeypatch, tmp_path):
     assert "event=turn_stop" in line
 
 
+def test_require_delivery_treats_kill_switch_skip_as_non_delivery(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "checkin.py",
+            "--event",
+            "auto_edit",
+            "--response-text",
+            "pending edits",
+            "--complexity",
+            "0.3",
+            "--confidence",
+            "0.6",
+            "--client-session-id",
+            "agent-test",
+            "--slot",
+            "slot-test",
+            "--require-delivery",
+        ],
+    )
+    with patch("checkin.submit_checkin", return_value="skip_kill_switch"):
+        assert checkin._cli() == 1
+
+
 def test_kill_switch_default_on(monkeypatch, tmp_path):
     """Unset UNITARES_CHECKINS defaults to on."""
     log_path = tmp_path / "checkins.log"
@@ -60,6 +147,27 @@ def test_kill_switch_default_on(monkeypatch, tmp_path):
 
     assert result == "sent"
     mock_post.assert_called_once()
+
+
+def test_explicit_timeout_is_forwarded_to_transport(monkeypatch, tmp_path):
+    """Synchronous hosts can reserve margin inside their outer hook deadline."""
+    monkeypatch.setenv("UNITARES_CHECKIN_LOG", str(tmp_path / "checkins.log"))
+
+    with patch(
+        "checkin._post_to_governance", return_value=(True, 1, None)
+    ) as mock_post:
+        result = checkin.submit_checkin(
+            event="turn_stop",
+            response_text="done",
+            complexity=0.3,
+            confidence=0.7,
+            client_session_id="agent-codex",
+            slot="codex-slot",
+            timeout=15,
+        )
+
+    assert result == "sent"
+    assert mock_post.call_args.kwargs == {"timeout": 15.0}
 
 
 def test_submit_checkin_never_raises_on_garbage_inputs(monkeypatch, tmp_path):
@@ -99,7 +207,7 @@ def test_submit_checkin_never_raises_on_garbage_inputs(monkeypatch, tmp_path):
 
     # Log should have two 'status=error' lines
     lines = log_path.read_text().strip().splitlines()
-    assert sum(1 for l in lines if "status=error" in l) == 2
+    assert sum(1 for line in lines if "status=error" in line) == 2
 
 
 def test_log_format_resilient_to_pathological_error_text(monkeypatch, tmp_path):

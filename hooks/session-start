@@ -18,6 +18,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+HOOK_HOST="claude"
+if [[ "${1:-}" == "--host" && -n "${2:-}" ]]; then
+  HOOK_HOST="$2"
+fi
+if [[ "${HOOK_HOST}" != "claude" && "${HOOK_HOST}" != "codex" ]]; then
+  exit 0
+fi
+
 DEFAULTS_FILE=""
 for candidate in \
   "${PLUGIN_ROOT}/config/defaults.env" \
@@ -159,20 +167,20 @@ fi
 # this hook is tightening against; the dispatch-side fix (per-thread
 # scratch dirs) is complementary, not redundant.
 #
-# The slot-scoped cache ./.unitares/session-<claude_session_id>.json, by
-# contrast, is owned by one specific claude process session. On --resume
+# The slot-scoped cache ./.unitares/session-<host_session_id>.json, by
+# contrast, is owned by one specific host process session. On resume
 # it matches; a fresh session writes its own. Under the identity ontology
 # its UUID is surfaced as a *lineage
 # candidate* — the predecessor this fresh process declares via
 # `parent_agent_id` — NOT as a resume credential.
 # ---------------------------------------------------------------------------
 WORKSPACE_LINEAGE_HINT=""
-CLAUDE_SESSION_ID=""
-# Claude Code sends the hook event as JSON on stdin, including session_id.
+HOST_SESSION_ID=""
+# Both supported hosts send the hook event as JSON with session_id.
 if [[ ! -t 0 ]]; then
   SESSION_START_STDIN=$(cat 2>/dev/null) || SESSION_START_STDIN=""
   if [[ -n "${SESSION_START_STDIN}" ]]; then
-    CLAUDE_SESSION_ID=$(python3 - "${SESSION_START_STDIN}" <<'PY' 2>/dev/null || true
+    HOST_SESSION_ID=$(python3 - "${SESSION_START_STDIN}" <<'PY' 2>/dev/null || true
 import json, sys
 try:
     data = json.loads(sys.argv[1])
@@ -187,9 +195,10 @@ fi
 WORKSPACE_CACHE=""
 NUDGE_MARKER=""
 NUDGE_ALREADY_SHOWN=0
-if [[ -n "${CLAUDE_SESSION_ID}" ]]; then
+SHOULD_WRITE_NUDGE_MARKER=0
+if [[ -n "${HOST_SESSION_ID}" ]]; then
   # Match session_cache.py _slot_suffix: alnum + [-_], cap at 64 chars.
-  SAFE_SLOT=$(python3 - "${CLAUDE_SESSION_ID}" <<'PY' 2>/dev/null || true
+  SAFE_SLOT=$(python3 - "${HOST_SESSION_ID}" <<'PY' 2>/dev/null || true
 import sys
 raw = sys.argv[1]
 safe = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in raw)
@@ -206,7 +215,7 @@ fi
 # Compact mode — when this workspace already has a fresh slot-scoped cache
 # (mtime < 1h), the agent has almost certainly seen the full Fundamentals
 # excerpt and the long onboard-prose this hour. Per-turn SessionStart
-# resume events fire frequently in normal Claude Code use; re-injecting
+# resume events can fire frequently in normal host use; re-injecting
 # the full ~3KB context every fire is repetition without information.
 # We collapse to a one-line prompt and skip the Fundamentals block.
 #
@@ -269,7 +278,7 @@ fi
 
 if [[ -z "${WORKSPACE_LINEAGE_HINT}" && -n "${WORKSPACE_CACHE}" && -f "${WORKSPACE_CACHE}" ]]; then
   WORKSPACE_LINEAGE_HINT=$(python3 - "${WORKSPACE_CACHE}" <<'PY' 2>/dev/null || true
-import json, sys
+import json, re, sys
 from pathlib import Path
 
 cache = Path(sys.argv[1])
@@ -279,16 +288,17 @@ except Exception:
     sys.exit(0)
 
 uuid = (data.get("uuid") or data.get("agent_uuid") or "").strip()
-if not uuid:
+if not re.fullmatch(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+    uuid,
+):
     sys.exit(0)
 
-label = data.get("display_name") or data.get("agent_id") or ""
 ts = data.get("updated_at", "")
-date_part = ts[:10] if ts else ""
+date_part = ts[:10] if isinstance(ts, str) and re.match(r"^\d{4}-\d{2}-\d{2}(?:T|$)", ts) else ""
 
 header = "A prior process-instance ran in this workspace"
-if label:
-    header += f" as {label}"
 if date_part:
     header += f" (last active {date_part})"
 header += f"; UUID `{uuid}`."
@@ -313,7 +323,7 @@ fi
 # ---------------------------------------------------------------------------
 # Scan-newest secondary lineage fallback (S20.2 / §3b)
 #
-# When a Claude session_id is present but its slot-scoped cache file does
+# When a host session_id is present but its slot-scoped cache file does
 # not exist (cross-`/clear` case: harness minted a fresh session_id, prior
 # work in this workspace lives under a different slot), fall back to
 # `session_cache.py list --workspace "$PWD"` and surface the **newest** prior slot's
@@ -335,7 +345,7 @@ fi
 #     conversation) from a workspace match (this workspace's most recent
 #     prior session, but possibly a different harness invocation).
 # ---------------------------------------------------------------------------
-if [[ -n "${CLAUDE_SESSION_ID}" && -z "${WORKSPACE_LINEAGE_HINT}" ]]; then
+if [[ -n "${HOST_SESSION_ID}" && -z "${WORKSPACE_LINEAGE_HINT}" ]]; then
   SESSION_CACHE_HELPER=""
   for candidate in \
     "${PLUGIN_ROOT}/scripts/session_cache.py" \
@@ -359,7 +369,7 @@ if [[ -n "${CLAUDE_SESSION_ID}" && -z "${WORKSPACE_LINEAGE_HINT}" ]]; then
       # also avoids the ARG_MAX risk that ruled out argv passing.
       WORKSPACE_LINEAGE_HINT=$(SCAN_LIST_JSON="${SCAN_LIST_JSON}" \
         python3 - "${LINEAGE_MAX_AGE_DAYS}" <<'PY' 2>/dev/null || true
-import json, os, sys
+import json, os, re, sys
 from datetime import datetime, timezone, timedelta
 
 try:
@@ -379,6 +389,10 @@ cutoff = now - timedelta(days=max(0, max_age_days))
 # accepted ceiling to "now plus a few minutes" so legitimate clock
 # drift still passes but planted-future entries are rejected.
 ceiling = now + timedelta(minutes=5)
+uuid_pattern = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 
 def parse_ts(value):
     if not isinstance(value, str) or not value:
@@ -403,7 +417,7 @@ for entry in entries:
     if entry.get("slot") is None:
         continue
     uuid = (entry.get("parent_agent_id") or "").strip()
-    if not uuid:
+    if not uuid_pattern.fullmatch(uuid):
         continue
     ts = parse_ts(entry.get("updated_at"))
     if ts is None:
@@ -441,7 +455,7 @@ print(
     "session, and NOT lineage by default). Another process-instance "
     f"previously wrote a slot file in this workspace — slot `{slot}`, last "
     f"active {date_part} ({age_text}). The prior process may have been a "
-    "different Claude session (e.g. before `/clear`), a Codex run, a "
+    "different client session (for example before a context reset), another "
     "dispatch worker, or an ad-hoc script.\n\nUnder the identity ontology "
     "onboard fresh — co-location is not lineage:\n"
     "    start_session(force_new=true)\n"
@@ -477,6 +491,11 @@ if [[ -n "${UNITARES_CLIENT_SESSION_ID:-}" \
   ANCHOR_RESUME_ENABLED=1
 fi
 
+RECOVERY_GUIDANCE="Recovery: call identity() to inspect continuity, check_working_state() for governance state, and health_check() for server health."
+if [[ "${HOOK_HOST}" == "claude" ]]; then
+  RECOVERY_GUIDANCE="Recovery: run /diagnose."
+fi
+
 if [[ -z "${HEALTH_STATUS}" ]]; then
   CONTEXT="UNITARES Governance: OFFLINE (${SERVER_URL} unreachable). No governance identity is currently bound for this session. Governance tools may be unavailable."
   if [[ -n "${SKILL_CONTENT}" ]]; then
@@ -507,7 +526,7 @@ than minting. Declare \`parent_agent_id\` only for a real spawn/handoff, never
 for the turn-to-turn flow of this conversation.
 Use \`sync_state(...)\` only for meaningful state worth reporting; do not
 manufacture a check-in to satisfy this note.
-Recovery: run /diagnose."
+${RECOVERY_GUIDANCE}"
   elif [[ "${COMPACT_MODE}" == "1" ]]; then
     # Compact prose: assumes the agent saw the full note + Fundamentals
     # excerpt earlier this hour (workspace cache mtime < TTL). Keep
@@ -519,16 +538,15 @@ Slot-scoped governance state is present for this session. Continue normally.
 Use \`sync_state(...)\` only for meaningful state worth reporting; do not create a check-in just to satisfy a hook reminder.
 If you intentionally need a fresh governance identity for this process, use \`start_session(force_new=true)\` (\`onboard(...)\` canonical) and declare \`parent_agent_id\` only for a real spawn/handoff (see lineage hint below), not for co-location.
 After governance calls, read \`next_action\`, \`memory_suggestions\`, and \`recovery_hint\` when present.
-Recovery: run /diagnose."
+${RECOVERY_GUIDANCE}"
   elif [[ "${NUDGE_ALREADY_SHOWN}" == "1" ]]; then
     CONTEXT="UNITARES Governance: ONLINE
 Onboarding context was already shown for this session. If no identity is cached by turn stop, the Stop hook will lazily create a slot-scoped governance identity before emitting its substrate summary.
 Use \`sync_state(...)\` only for meaningful state worth reporting. Do not manufacture a check-in for this reminder.
-Recovery: run /diagnose."
+${RECOVERY_GUIDANCE}"
   else
     if [[ -n "${NUDGE_MARKER}" ]]; then
-      mkdir -p "$(dirname "${NUDGE_MARKER}")" 2>/dev/null || true
-      printf '{"shown_at":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${NUDGE_MARKER}" 2>/dev/null || true
+      SHOULD_WRITE_NUDGE_MARKER=1
     fi
     CONTEXT="UNITARES Governance: ONLINE
 
@@ -550,7 +568,7 @@ only when there is meaningful state worth reporting:
 
 Substrate hooks may record observations automatically. Those observations are
 not agent-authored check-ins and do not require you to echo them. Lazy
-onboarding is harness-managed attribution for this Claude process; it is not
+onboarding is harness-managed attribution for this ${HOOK_HOST} process; it is not
 an agent-authored claim.
 
 Under the identity ontology, fresh process-instances mint fresh
@@ -569,9 +587,8 @@ and \`recovery_hint\` when present. Treat \`memory_suggestions\` as optional
 retrieval prompts and \`recovery_hint\` as the first recovery route when a
 tool reports degraded or paused state.
 
-If you need to recover a specific prior identity by UUID, that is an
-operator action — run /diagnose for guided recovery rather than guessing
-a UUID."
+If you need to recover a specific prior identity by UUID, that is an operator
+action. ${RECOVERY_GUIDANCE} Do not guess a UUID."
   fi
 
   # Suppress the lineage hint on anchored sessions: it nudges force_new /
@@ -612,39 +629,93 @@ fi
 # empty briefing and never blocks session start.
 # ---------------------------------------------------------------------------
 WORKSPACE_BRIEFING=""
-if command -v git >/dev/null 2>&1 && git -C "${PWD}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+# Opt out when fleet operators need zero session-start coordination overhead.
+if [ "${HOOK_HOST}" = "claude" ] \
+   && [ "${UNITARES_HOOK_SKIP_WORKSPACE_BRIEFING:-}" != "1" ] \
+   && command -v git >/dev/null 2>&1 \
+   && git -C "${PWD}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   SELF_WT="$(git -C "${PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
   BRIEF_LINES=""
-  LIVE_COUNT=0
+  DIRTY_COUNT=0
   CUR_WT=""
+  CUR_HEAD=""
+  CUR_BRANCH=""
+
+  _brief_current_worktree() {
+    [ -n "${CUR_WT}" ] || return 0
+
+    # Resolve through git so macOS /var vs /private/var aliases cannot make
+    # this worktree report its own changes as a sibling conflict.
+    _cur_real="$(git -C "${CUR_WT}" rev-parse --show-toplevel 2>/dev/null || echo "${CUR_WT}")"
+    [ "${_cur_real}" != "${SELF_WT}" ] || return 0
+
+    # Parse NUL records without first converting attacker-controlled filenames
+    # to shell lines. Only conservative code-path characters may enter host
+    # context; whitespace/control-bearing names become opaque hashes.
+    _status_line="$(git -C "${CUR_WT}" status --porcelain -z --no-renames 2>/dev/null \
+      | python3 -c '
+import hashlib, json, os, re, sys
+
+safe_path = re.compile(r"[A-Za-z0-9._/@+:-]{1,240}")
+shown = []
+total = 0
+for record in sys.stdin.buffer.read().split(b"\0"):
+    if len(record) < 4:
+        continue
+    raw_path = record[3:]
+    total += 1
+    path = os.fsdecode(raw_path)
+    if safe_path.fullmatch(path):
+        shown.append(path)
+    else:
+        digest = hashlib.sha256(raw_path).hexdigest()[:12]
+        shown.append(f"<unsafe-path sha256:{digest}>")
+print(f"{total}\t{json.dumps(shown[:3], ensure_ascii=True, separators=(chr(44), chr(58)))}")
+' 2>/dev/null || true)"
+    [ -n "${_status_line}" ] || return 0
+    IFS=$'\t' read -r _total _shown <<<"${_status_line}"
+    case "${_total}" in
+      ''|*[!0-9]*|0) return 0 ;;
+    esac
+
+    _label="${CUR_BRANCH}"
+    if [ -z "${_label}" ]; then
+      _short_head="$(printf '%s' "${CUR_HEAD}" | cut -c1-12)"
+      _label="DETACHED:${_short_head:-unknown}"
+    fi
+
+    DIRTY_COUNT=$((DIRTY_COUNT + 1))
+    _more=""
+    if [ "${_total}" -gt 3 ] 2>/dev/null; then
+      _more=" (+$((_total - 3)) more)"
+    fi
+    BRIEF_LINES="${BRIEF_LINES}
+  - ${_label} -- uncommitted paths (unsafe names hashed): ${_shown}${_more}"
+  }
+
   while IFS= read -r _line; do
     case "${_line}" in
       "worktree "*)
         CUR_WT="${_line#worktree }"
         ;;
+      "HEAD "*)
+        CUR_HEAD="${_line#HEAD }"
+        ;;
       "branch refs/heads/"*)
-        _br="${_line#branch refs/heads/}"
-        # Only agent-authored branches count as sibling sessions; skip self,
-        # master, detached cron/backup worktrees.
-        if [ "${CUR_WT}" != "${SELF_WT}" ]; then
-          case "${_br}" in
-            claude/*|codex/*)
-              LIVE_COUNT=$((LIVE_COUNT + 1))
-              _dirty="$(git -C "${CUR_WT}" status --porcelain 2>/dev/null | awk '{print $NF}' | head -3 | paste -sd, - 2>/dev/null)"
-              if [ -n "${_dirty}" ]; then
-                BRIEF_LINES="${BRIEF_LINES}
-  - ${_br} -- uncommitted: ${_dirty}"
-              fi
-              ;;
-          esac
-        fi
+        CUR_BRANCH="${_line#branch refs/heads/}"
+        ;;
+      "")
+        _brief_current_worktree
+        CUR_WT=""
+        CUR_HEAD=""
+        CUR_BRANCH=""
         ;;
     esac
-  done < <(git -C "${PWD}" worktree list --porcelain 2>/dev/null | head -200)
+  done < <({ git -C "${PWD}" worktree list --porcelain 2>/dev/null | head -200 || true; printf '\n'; })
   if [ -n "${BRIEF_LINES}" ]; then
     WORKSPACE_BRIEFING="Workspace coordination (git-sourced -- concurrent worktrees of this repo, NOT governance state):
-${LIVE_COUNT} sibling agent branch(es) are checked out in this repo. The following carry UNCOMMITTED edits that will collide if you touch the same files -- coordinate (or branch from their head) before editing those paths:${BRIEF_LINES}
-This is local git ground truth (adoption-independent). 'Checked out' is not a proven-running process; treat it as a heads-up, not a lock."
+${DIRTY_COUNT} sibling worktree(s) carry uncommitted edits that may overlap if you edit the same files -- coordinate (or branch from their head) before touching these paths:${BRIEF_LINES}
+This is local git ground truth (adoption-independent). Work in separate worktrees conflicts only when the same file is edited, and a dirty worktree may be stale; treat this as a heads-up, not a lock."
   fi
 fi
 
@@ -655,12 +726,20 @@ ${WORKSPACE_BRIEFING}"
 fi
 
 ESCAPED_CONTEXT="$(escape_for_json "${CONTEXT}")"
-cat <<ENDJSON
+# Persist delivery state only after stdout accepts the serialized response. If
+# the host kills SessionStart or closes the pipe first, the next run must still
+# show the full first-turn nudge.
+if cat <<ENDJSON
 {
-  "additional_context": "${ESCAPED_CONTEXT}",
   "hookSpecificOutput": {
     "hookEventName": "SessionStart",
     "additionalContext": "${ESCAPED_CONTEXT}"
   }
 }
 ENDJSON
+then
+  if [[ "${SHOULD_WRITE_NUDGE_MARKER}" == "1" && -n "${NUDGE_MARKER}" ]]; then
+    mkdir -p "$(dirname "${NUDGE_MARKER}")" 2>/dev/null || true
+    printf '{"shown_at":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${NUDGE_MARKER}" 2>/dev/null || true
+  fi
+fi

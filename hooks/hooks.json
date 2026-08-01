@@ -6,17 +6,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" pre-edit",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" pre-edit --host claude",
             "async": false
           }
         ]
       },
       {
-        "matcher": "mcp__.*__(process_agent_update|sync_state|get_governance_metrics|check_working_state|outcome_event|record_result|knowledge|search_shared_memory|leave_note|dialectic|request_review|observe|calibration|export|config|agent|self_recovery|archive_orphan_agents|list_tools|describe_tool|health_check)",
+        "matcher": "mcp__.*__(onboard|start_session|identity|bind_session|process_agent_update|sync_state|get_governance_metrics|check_working_state|outcome_event|record_result|knowledge|search_shared_memory|leave_note|dialectic|request_review|observe|calibration|export|config|agent|self_recovery|archive_orphan_agents|list_tools|describe_tool|health_check)",
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" pre-governance-call",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" pre-governance-call --host claude",
             "async": false
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" session-start",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" session-start --host claude",
             "async": false
           }
         ]
@@ -40,8 +40,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" session-end",
-            "async": false
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" session-end --host claude",
+            "async": false,
+            "timeout": 1
           }
         ]
       }
@@ -52,8 +53,66 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" post-stop",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" post-stop --host claude",
             "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" post-edit-release --host claude",
+            "async": false,
+            "timeout": 6
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*__(process_agent_update|sync_state)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" post-checkin --host claude",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PermissionDenied": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" post-edit-release --host claude",
+            "async": false,
+            "timeout": 6
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*__(process_agent_update|sync_state)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" post-checkin --host claude",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolBatch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" post-edit-batch-release --host claude",
+            "async": false,
+            "timeout": 6
           }
         ]
       }
@@ -64,7 +123,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" post-edit",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" post-edit-release --host claude",
+            "async": false,
+            "timeout": 6
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" post-edit --host claude",
             "async": true
           }
         ]
@@ -74,7 +139,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" post-checkin",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" post-checkin --host claude",
             "async": true
           }
         ]
@@ -84,7 +149,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" post-identity",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" post-identity --host claude",
             "async": true
           }
         ]

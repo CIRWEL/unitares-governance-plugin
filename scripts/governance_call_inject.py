@@ -15,27 +15,33 @@ separators, de-dup) before they reach the server, so the shared graph does
 not fragment on `Postgres`/`postgres`/`PostgreSQL`. That pass is
 formatting-only, runs independently of (and never disables) identity
 injection, and lives in scripts/tag_normalize.py — see docs/ontology-need.md.
+Codex does not rewrite multi-action knowledge calls because applying any input
+rewrite there would also pre-approve the call.
 
 Contract:
-- Only fires for MCP tools whose server segment is the local UNITARES server
-  alias ("governance") or contains "unitares".
+- Only fires for MCP tools whose case-normalized server segment exactly matches
+  a configured UNITARES alias. Lookalike names receive no rewrite or implicit
+  Codex approval.
 - Only fires for an explicit suffix allowlist of attribution-relevant tools
   verified to accept client_session_id (schemas inherit AgentIdentityMixin
   server-side). Unknown/new tools get NO injection — they degrade to today's
   pin behavior rather than risking an extra-field validation error.
-- For identity minting tools, only fires for anchored bare onboard/start_session
-  calls: when UNITARES_CLIENT_SESSION_ID is set and force_new is absent, inject
-  that anchor so manual start_session() follows the same per-thread resume path
-  as lazy onboarding. Explicit force_new and explicit proof fields still win.
-  Never injects into bind_session/identity.
+- For identity minting tools, only fires for orchestrated anchored bare
+  onboard/start_session calls: UNITARES_CLIENT_SESSION_ID and a truthy
+  UNITARES_ORCHESTRATED marker must both be present, and force_new must be
+  absent. Explicit force_new and explicit proof fields still win. Never
+  injects into bind_session/identity.
 - Skips when the call already carries any identity proof field
   (client_session_id, continuity_token, agent_uuid, agent_id) — explicit
   caller intent always wins.
 - Reads ONLY the slot-scoped session cache (slot = Claude session_id via
   _session_lookup; no workspace-flat fallback). With the post-identity
   subagent guard, the slot cache holds the driver's identity.
-- Emits hookSpecificOutput.updatedInput WITHOUT permissionDecision, so the
-  normal permission flow is unchanged.
+- Claude emits hookSpecificOutput.updatedInput without a permission decision,
+  so its normal permission flow is unchanged. Codex requires
+  permissionDecision="allow" whenever updatedInput is returned. Codex rewrites
+  only anchored lifecycle, check-in, and read-only diagnostic calls; admin-
+  capable tools keep their normal permission flow and require explicit proof.
 - Fails open: any error or missing cache → no output, tool runs untouched.
 
 Known residual (KNOWINGLY ACCEPTED, council-reviewed 2026-06-12): both this
@@ -59,12 +65,15 @@ agent-asserted proof — the agent never typed the token.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from governance_tool_name import governance_tool_suffix
 
 # Tag normalization (formatting-only, fail-open) is folded into this single
 # hook on purpose: a second PreToolUse hook emitting its own updatedInput for
@@ -99,13 +108,30 @@ INJECT_SUFFIXES = frozenset({
     "list_tools", "describe_tool", "health_check",
 })
 
+# Codex can only apply updatedInput by also allowing the tool call. Keep that
+# implicit approval narrowly scoped to lifecycle/check-in and read-only
+# diagnostics. Administrative and multi-action tools must carry identity
+# explicitly so their normal permission flow remains intact.
+CODEX_REWRITE_SUFFIXES = frozenset({
+    "process_agent_update", "sync_state",
+    "get_governance_metrics", "check_working_state",
+    "list_tools", "describe_tool", "health_check",
+})
+
 ANCHORED_MINT_SUFFIXES = frozenset({"onboard", "start_session"})
 PROOF_FIELDS = ("client_session_id", "continuity_token", "agent_uuid", "agent_id")
 
 
-def _is_governance_server(server: str) -> bool:
-    """Return True for MCP server aliases owned by UNITARES governance."""
-    return server == "governance" or "unitares" in server
+def _hook_output(updated: dict, host: str) -> dict:
+    """Build the host-specific PreToolUse rewrite envelope."""
+    specific: dict[str, object] = {
+        "hookEventName": "PreToolUse",
+        "updatedInput": updated,
+    }
+    if host == "codex":
+        # Codex ignores updatedInput unless the hook explicitly allows it.
+        specific["permissionDecision"] = "allow"
+    return {"hookSpecificOutput": specific}
 
 
 def _has_proof_field(tool_input: dict) -> bool:
@@ -122,11 +148,18 @@ def _has_proof_field(tool_input: dict) -> bool:
 
 
 def _env_anchor() -> str:
+    orchestrated = os.environ.get("UNITARES_ORCHESTRATED", "").strip().lower()
+    if orchestrated not in {"1", "true", "yes", "on"}:
+        return ""
     value = os.environ.get("UNITARES_CLIENT_SESSION_ID", "")
     return value.strip()
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Normalize a governance PreToolUse call")
+    parser.add_argument("--host", choices=("claude", "codex"), default="claude")
+    args = parser.parse_args(argv)
+
     try:
         raw = sys.stdin.read()
         data = json.loads(raw or "{}")
@@ -135,17 +168,16 @@ def main() -> int:
     if not isinstance(data, dict):
         return 0
 
-    tool_name = data.get("tool_name") or ""
-    if not isinstance(tool_name, str) or not tool_name.startswith("mcp__"):
-        return 0
-    parts = tool_name.split("__")
-    if len(parts) < 3:
-        return 0
-    server = "__".join(parts[1:-1]).lower()
-    suffix = parts[-1].lower()
-    if not _is_governance_server(server):
+    suffix = governance_tool_suffix(data.get("tool_name"), host=args.host)
+    if suffix is None:
         return 0
     if suffix not in INJECT_SUFFIXES and suffix not in ANCHORED_MINT_SUFFIXES:
+        return 0
+    if (
+        args.host == "codex"
+        and suffix not in CODEX_REWRITE_SUFFIXES
+        and suffix not in ANCHORED_MINT_SUFFIXES
+    ):
         return 0
 
     tool_input = data.get("tool_input")
@@ -169,12 +201,7 @@ def main() -> int:
             changed = True
         if not changed:
             return 0
-        print(json.dumps({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "updatedInput": updated,
-            }
-        }))
+        print(json.dumps(_hook_output(updated, args.host)))
         return 0
 
     # Tag normalization runs independently of identity injection: it applies
@@ -205,12 +232,7 @@ def main() -> int:
 
     if not changed:
         return 0
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "updatedInput": updated,
-        }
-    }))
+    print(json.dumps(_hook_output(updated, args.host)))
     return 0
 
 

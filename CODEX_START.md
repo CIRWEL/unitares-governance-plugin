@@ -2,6 +2,70 @@
 
 Use this path if you are working from Codex or ChatGPT and want the cleanest UNITARES workflow without depending on Claude-only hooks.
 
+## Install In Codex
+
+Codex CLI 0.146.0 is the minimum tested version.
+
+Add this repository as a marketplace source:
+
+```bash
+codex plugin marketplace add cirwel/unitares-governance-plugin
+```
+
+Start Codex, open `/plugins`, install and enable `UNITARES Governance`, then
+start a new session. The bundle registers an unauthenticated local server at
+`http://localhost:8767/mcp/` and loads a Codex-specific synchronous hook file.
+It does not read `UNITARES_HTTP_API_TOKEN` for this bundled MCP transport. Open
+`/hooks` to review and trust those command hooks; Codex skips untrusted plugin
+hooks by design.
+
+On Windows, install Git for Windows with Git Bash and Python 3.12+ exposed to
+Git Bash as `python3`. The hook wrapper fails visibly when Bash is unavailable;
+with `UNITARES_FILE_LEASES_REQUIRED=1`, its PreToolUse path denies edits instead
+of silently bypassing required leases.
+
+Claude uses `.mcp.json`, including its `UNITARES_SERVER_URL` expansion and an
+optional `Authorization` header sourced from `UNITARES_HTTP_API_TOKEN`, plus the
+async handlers in `hooks/hooks.json`. Current Claude hook payloads scope its
+bundled server as `plugin_unitares-governance_unitares-governance`, so a tool
+arrives as
+`mcp__plugin_unitares-governance_unitares-governance__<tool>`. Codex uses the
+concrete unauthenticated local transport in `.codex-mcp.json`, plus synchronous
+`hooks/codex-hooks.json`, and reports the bare
+`mcp__unitares-governance__<tool>` form. The separate files keep each host's
+configuration, naming, and execution contracts explicit.
+
+The edit contract is also host-specific. Codex reports the canonical
+`apply_patch` tool with a patch envelope in `tool_input.command`; it does not
+send Claude's scalar `tool_input.file_path`. The adapter leases every path in
+that envelope under the invocation's `tool_use_id`, records one local
+milestone, and exits. It does not perform a synchronous per-edit governance
+check-in. Codex Stop summaries read `last_assistant_message`; tool counts are
+left unavailable rather than reported as zero. The synchronous Stop path caps
+lazy onboarding at 5 seconds and its check-in at 15 seconds, leaving process
+and cache overhead inside the 30-second hook deadline.
+
+For a hosted, authenticated, or otherwise non-local server, disable the bundled
+local transport and register the separate URL under the exact
+`unitares-governance` alias. Exporting a token alone does not add authentication
+to the bundled localhost entry. Runtime hook policy uses a case-normalized
+alias allowlist; substring lookalikes and Claude's plugin-scoped alias are
+deliberately ignored at the Codex boundary and never implicitly approved:
+
+```toml
+# ~/.codex/config.toml
+[plugins."unitares-governance@unitares-governance".mcp_servers.unitares-governance]
+enabled = false
+```
+
+```bash
+export UNITARES_SERVER_URL=https://gov.example.org
+export UNITARES_HTTP_API_TOKEN='replace-with-client-token'
+codex mcp add unitares-governance \
+  --url "${UNITARES_SERVER_URL%/}/mcp/" \
+  --bearer-token-env-var UNITARES_HTTP_API_TOKEN
+```
+
 ## Goal
 
 Connect to a running UNITARES governance server, preserve continuity cleanly,
@@ -69,19 +133,20 @@ debugging the underlying protocol.
 
 ## Recommended Flow
 
-1. Run `/governance-start`
+1. Follow the bundled `unitares-governance:governance-lifecycle` skill and call `start_session(force_new=true)`
 2. Keep continuity in slot-scoped `.unitares/session-<slot>.json` caches
 3. Do real work
-4. Run `/checkin` once per assistant turn, and after meaningful milestones
-5. Run `/diagnose` when continuity or governance state looks wrong
-6. Use `/dialectic` when you need structured review
+4. Call `sync_state(...)` once per assistant turn, and after meaningful milestones
+5. Call `identity()`, `check_working_state()`, and `health_check()` when continuity or governance state looks wrong
+6. Follow the bundled `unitares-governance:dialectic-reasoning` skill and call `dialectic(...)` when you need structured review
 
 With Codex lifecycle hooks configured/trusted, step 4 becomes a baseline rather
 than the only safety net: the Stop hook emits one turn-stop check-in, while
-manual `/checkin` remains the right tool for meaningful milestones and
-agent-authored state.
+manual `sync_state(...)` remains the right tool for meaningful milestones and
+agent-authored state. The repository's `commands/` directory is a Claude Code
+surface; Codex plugins do not install those custom slash commands.
 
-If you are not using commands directly, the equivalent raw tool flow is:
+The raw tool flow is:
 
 1. First run of a fresh process: `start_session(force_new=true)` (`onboard(...)` is the canonical equivalent)
 2. Fresh process continuing finished prior work: `start_session(force_new=true, parent_agent_id=<saved uuid>, spawn_reason="new_session")`
@@ -135,7 +200,7 @@ returned it and to rare same-live-process proof-owned rebinds.
 
 Typical session:
 
-- start or declare lineage with `/governance-start`
+- start or declare lineage with `start_session(...)`
 - do meaningful work
 - check in once per assistant turn as a baseline
 - add a check-in after a milestone, completed step, or decision point
@@ -151,7 +216,7 @@ identity mints are not.
 - `continuity_token`: short-lived ownership proof for same-owner rebinding, not indefinite cross-process resume
 - `client_session_id`: in-session transport continuity metadata
 - `parent_agent_id`: lineage declaration for a fresh process continuing prior work
-- `session_resolution_source`: if this falls back to a weak source, rerun `/governance-start`
+- `session_resolution_source`: if this falls back to a weak source, inspect `identity()` and start a fresh session only when the process contract calls for one
 - `identity_assurance`: strong is better than implicit
 
 Use the local audit when continuity looks suspicious:
@@ -163,12 +228,12 @@ python3 scripts/audit_identity_contract.py --workspace "$PWD" --log-tail 200
 It checks the neutral cache and check-in log for token-at-rest violations, empty
 identity stubs, weak resolution sources, and floor/failure log statuses.
 
-## Commands
+## Codex Skills And Tools
 
-- `/governance-start` to create or declare lineage and refresh local continuity state
-- `/checkin` for the turn baseline and meaningful milestones
-- `/diagnose` for identity, state, and operator diagnostics
-- `/dialectic` for structured review
+- `unitares-governance:governance-lifecycle` skill plus `start_session(...)` for onboarding and declared lineage
+- `sync_state(...)` for the turn baseline and meaningful milestones
+- `identity()`, `check_working_state()`, and `health_check()` for diagnosis
+- `unitares-governance:dialectic-reasoning` skill plus `dialectic(...)` for structured review
 
 ## Claude Note
 

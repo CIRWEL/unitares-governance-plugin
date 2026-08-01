@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Identity-free substrate FLOOR poster.
 
-When a Claude session never onboarded (no client_session_id), the Stop hook
+When a host session never onboarded (no client_session_id), the Stop hook
 still emits one MEASUREMENT that the session ran — POSTed to the governance
 server's ``/v1/substrate/observe`` endpoint. This is NOT a check-in and NOT an
 identity claim: it writes to ``core.substrate_observations`` (an identity-free
-sink) keyed on the raw Claude session slot. Its only job is to turn the silent
+sink) keyed on the raw host session slot. Its only job is to turn the silent
 zero of an un-onboarded session into a counted, measurable coverage gap.
 
 Deliberately separate from ``checkin.py``: the floor must never touch the
@@ -22,6 +22,11 @@ import time
 import urllib.error
 import urllib.request
 
+try:
+    from ._http_auth import authorization_safe_urlopen, governance_json_headers
+except ImportError:  # Executed directly from an installed plugin.
+    from _http_auth import authorization_safe_urlopen, governance_json_headers
+
 DEFAULT_SERVER_URL = "http://localhost:8767"
 POST_TIMEOUT_SEC = 5.0
 SLOT_MAX = 256
@@ -30,6 +35,7 @@ SUMMARY_MAX = 512
 # Reuse plugin-local helpers when importable; degrade gracefully if not so the
 # floor can never crash a turn on an import error.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 try:
     from checkin import (  # type: ignore
         redact_secrets,
@@ -57,11 +63,11 @@ def _post(url: str, payload: dict, timeout: float = POST_TIMEOUT_SEC):
     req = urllib.request.Request(
         f"{url}/v1/substrate/observe",
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=governance_json_headers(),
     )
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with authorization_safe_urlopen(req, timeout=timeout) as resp:
             resp.read()  # drain
         return True, int((time.monotonic() - t0) * 1000), None
     except urllib.error.URLError as e:
@@ -113,7 +119,7 @@ def submit_floor(
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Identity-free substrate floor poster")
-    p.add_argument("--slot", required=True, help="raw Claude session_id (the floor disambiguator)")
+    p.add_argument("--slot", required=True, help="raw host session_id (the floor disambiguator)")
     p.add_argument("--event", default="turn_stop")
     p.add_argument("--tool-count", type=int, default=0)
     p.add_argument("--summary", default="")
