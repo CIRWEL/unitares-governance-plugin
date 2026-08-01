@@ -84,10 +84,20 @@ print(json.dumps(sys.argv[1])[1:-1])
 # ---------------------------------------------------------------------------
 SKILL_CONTENT=""
 SKILL_SOURCE=""
+SKILL_POINTER=""
 FETCH_SKILLS_HELPER="${PLUGIN_ROOT}/scripts/_fetch_skills.py"
 SKILL_FETCHED=""
 SKILL_STDERR_FILE=""
-if [[ -f "${FETCH_SKILLS_HELPER}" ]]; then
+# Claude Code exposes the bundled skill on demand via the Skill tool
+# (`unitares-governance:governance-fundamentals`), with its own freshness
+# check at invocation time. Injecting the 80-line excerpt there duplicates
+# a surface the host already provides — ~1k tokens per fresh session-start
+# and again on every post-TTL re-fire. Emit a pointer instead and skip the
+# fetch entirely (one less python spawn + server round-trip at SessionStart).
+# Codex and other hosts have no skill system; they keep the full excerpt.
+if [[ "${HOOK_HOST}" == "claude" ]]; then
+  SKILL_POINTER="Full reference available on demand: invoke the \`unitares-governance:governance-fundamentals\` skill (EISV dimensions, basins, verdicts, calibration, recovery). Read it before interpreting governance metrics; do not guess semantics."
+elif [[ -f "${FETCH_SKILLS_HELPER}" ]]; then
   SKILL_STDERR_FILE=$(mktemp -t unitares-fetch-skills.XXXXXX 2>/dev/null || true)
   if [[ -n "${SKILL_STDERR_FILE}" ]]; then
     SKILL_FETCHED=$(python3 "${FETCH_SKILLS_HELPER}" \
@@ -110,7 +120,9 @@ if [[ -f "${FETCH_SKILLS_HELPER}" ]]; then
       --server-url "${SERVER_URL}" 2>/dev/null || true)
   fi
 fi
-if [[ -n "${SKILL_FETCHED}" ]]; then
+if [[ -n "${SKILL_POINTER}" ]]; then
+  : # claude host: pointer only — never materialize excerpt content
+elif [[ -n "${SKILL_FETCHED}" ]]; then
   SKILL_CONTENT="$(printf '%s\n' "${SKILL_FETCHED}" | sed -n '1,80p')"
 else
   # Helper missing or returned empty — last-ditch direct read of the
@@ -503,6 +515,11 @@ if [[ -z "${HEALTH_STATUS}" ]]; then
 
 --- Governance Fundamentals (reference) ---
 ${SKILL_CONTENT}"
+  elif [[ -n "${SKILL_POINTER}" ]]; then
+    CONTEXT="${CONTEXT}
+
+--- Governance Fundamentals (via skill) ---
+${SKILL_POINTER}"
   fi
 else
   if [[ "${ANCHOR_RESUME_ENABLED}" == "1" ]]; then
@@ -602,11 +619,18 @@ ${WORKSPACE_LINEAGE_HINT}"
   # Skip the Fundamentals excerpt in compact mode. The freshness warning
   # (if any) still injects on the *next* fresh-workspace fire when the
   # full block returns, so calibration on stale skill files isn't lost.
-  if [[ "${ANCHOR_RESUME_ENABLED}" != "1" && "${COMPACT_MODE}" != "1" && "${NUDGE_ALREADY_SHOWN}" != "1" && -n "${SKILL_CONTENT}" ]]; then
-    CONTEXT="${CONTEXT}
+  if [[ "${ANCHOR_RESUME_ENABLED}" != "1" && "${COMPACT_MODE}" != "1" && "${NUDGE_ALREADY_SHOWN}" != "1" ]]; then
+    if [[ -n "${SKILL_CONTENT}" ]]; then
+      CONTEXT="${CONTEXT}
 
 --- Governance Fundamentals (excerpt)${SKILL_SOURCE_SUFFIX} ---
 ${SKILL_CONTENT}"
+    elif [[ -n "${SKILL_POINTER}" ]]; then
+      CONTEXT="${CONTEXT}
+
+--- Governance Fundamentals (via skill) ---
+${SKILL_POINTER}"
+    fi
   fi
 fi
 
