@@ -3,23 +3,23 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "apply_patch|Edit|Write|MultiEdit",
+        "matcher": "^apply_patch$",
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" pre-edit",
-            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" pre-edit",
-            "timeout": 5
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" pre-edit --host codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" pre-edit --host codex",
+            "timeout": 6
           }
         ]
       },
       {
-        "matcher": "mcp__.*__(onboard|start_session|process_agent_update|sync_state|get_governance_metrics|check_working_state|outcome_event|record_result|knowledge|search_shared_memory|leave_note|dialectic|request_review|observe|calibration|export|config|agent|self_recovery|archive_orphan_agents|list_tools|describe_tool|health_check)",
+        "matcher": "mcp__.*__(onboard|start_session|identity|bind_session|process_agent_update|sync_state|get_governance_metrics|check_working_state|outcome_event|record_result|knowledge|search_shared_memory|leave_note|dialectic|request_review|observe|calibration|export|config|agent|self_recovery|archive_orphan_agents|list_tools|describe_tool|health_check)",
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" pre-governance-call",
-            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" pre-governance-call",
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" pre-governance-call --host codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" pre-governance-call --host codex",
             "timeout": 5
           }
         ]
@@ -31,8 +31,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" session-start",
-            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" session-start",
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" session-start --host codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" session-start --host codex",
             "timeout": 15,
             "additionalContextLimit": 12000
           }
@@ -41,12 +41,12 @@
     ],
     "SessionEnd": [
       {
-        "matcher": "*",
+        "matcher": "other",
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" session-end",
-            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" session-end",
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" session-end --host codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" session-end --host codex",
             "timeout": 3
           }
         ]
@@ -57,8 +57,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" post-stop",
-            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" post-stop",
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" post-stop --host codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" post-stop --host codex",
             "timeout": 30
           }
         ]
@@ -66,13 +66,13 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "apply_patch|Edit|Write|MultiEdit",
+        "matcher": "^apply_patch$",
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" post-edit",
-            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" post-edit",
-            "timeout": 30
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" post-edit --host codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" post-edit --host codex",
+            "timeout": 6
           }
         ]
       },
@@ -81,8 +81,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" post-checkin",
-            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" post-checkin",
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" post-checkin --host codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" post-checkin --host codex",
             "timeout": 5
           }
         ]
@@ -92,8 +92,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" post-identity",
-            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" post-identity",
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" post-identity --host codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" post-identity --host codex",
             "timeout": 5
           }
         ]

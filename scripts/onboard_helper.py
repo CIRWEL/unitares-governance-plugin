@@ -26,16 +26,24 @@ import hashlib
 import json
 import os
 import sys
-import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional, Tuple
+
+from _http_auth import authorization_safe_urlopen
+from _session_cache_io import (
+    home_session_mirror_is_valid,
+    replace_session_cache,
+    reserve_session_cache_snapshot,
+    update_session_cache,
+)
 
 DEFAULT_SERVER_URL = "http://localhost:8767"
 DEFAULT_TIMEOUT = 10.0
 CACHE_DIR = ".unitares"
 CACHE_FILE = "session.json"
+CacheGenerationToken = Tuple[int, Optional[int]]
 
 # Genesis bootstrap — an OPTIONAL trajectory anchor (OFF by default).
 #
@@ -169,7 +177,7 @@ def _post_json(url: str, payload: dict, timeout: float, token: str | None) -> di
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with authorization_safe_urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         return _failure_response(
@@ -196,6 +204,16 @@ def _post_json(url: str, payload: dict, timeout: float, token: str | None) -> di
         )
 
 
+def _cache_path(workspace: Path, slot: str | None = None) -> Path:
+    return workspace / CACHE_DIR / _slot_filename(slot)
+
+
+def _home_cache_path(slot: str | None) -> Path | None:
+    if not slot:
+        return None
+    return Path.home() / CACHE_DIR / _slot_filename(slot)
+
+
 def _read_cache(workspace: Path, slot: str | None = None) -> dict:
     """Read the cache for this slot. No cross-slot fallback.
 
@@ -204,9 +222,17 @@ def _read_cache(workspace: Path, slot: str | None = None) -> dict:
     A slotted session that has no cache yet returns {} — fresh onboard,
     not inheritance from another session's identity.
     """
-    path = workspace / CACHE_DIR / _slot_filename(slot)
+    path = _cache_path(workspace, slot)
     if not path.exists():
         return {}
+    home_path = _home_cache_path(slot)
+    if home_path is not None:
+        normalized_path = path.parent.resolve() / path.name
+        normalized_home = home_path.parent.resolve() / home_path.name
+        if normalized_path == normalized_home and not home_session_mirror_is_valid(
+            home_path
+        ):
+            return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
@@ -214,35 +240,69 @@ def _read_cache(workspace: Path, slot: str | None = None) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _mirror_error(path: Path, exc: Exception) -> None:
+    print(
+        f"onboard_helper.py: home-mirror write failed ({exc!r}); "
+        f"invalidated stale fallback at {path}",
+        file=sys.stderr,
+    )
+
+
+def _read_cache_snapshot(
+    workspace: Path,
+    slot: str | None = None,
+) -> tuple[dict[str, Any], CacheGenerationToken]:
+    """Read identity state while reserving this network call's commit order."""
+    payload, generation, authority_generation = reserve_session_cache_snapshot(
+        _cache_path(workspace, slot),
+        home_path=_home_cache_path(slot),
+    )
+    return payload, (generation, authority_generation)
+
+
 def _write_cache(workspace: Path, payload: dict, slot: str | None = None) -> None:
-    """Atomic cache write with mode 0600.
+    """Write one cache and its slotted HOME fallback transactionally."""
+    path = _cache_path(workspace, slot)
+    replace_session_cache(
+        path,
+        payload,
+        home_path=_home_cache_path(slot),
+        on_mirror_error=_mirror_error,
+    )
 
-    Mirrors the write-path contract of ``scripts/session_cache.py:_write_json``:
-    atomic via ``mkstemp`` + ``os.replace``, mode 0600 via ``fchmod`` on
-    the temp fd before rename. The default ``Path.write_text`` inherits
-    umask 022 → mode 0644, leaving cached identity world-readable on a
-    typical macOS setup; any same-UID process could read the file. S20.3.
 
-    On any write/chmod/replace failure, the temp file is unlinked rather
-    than left as a turd in ``.unitares/``.
+def _update_cache_transaction(
+    workspace: Path,
+    mutator: Callable[[dict[str, Any]], dict[str, Any] | None],
+    slot: str | None = None,
+    *,
+    expected_generation: int | CacheGenerationToken | None = None,
+) -> tuple[dict[str, Any], bool]:
+    expected_authority_generation: int | None = None
+    if isinstance(expected_generation, tuple):
+        expected_generation, expected_authority_generation = expected_generation
+    return update_session_cache(
+        _cache_path(workspace, slot),
+        mutator,
+        home_path=_home_cache_path(slot),
+        expected_generation=expected_generation,
+        expected_authority_generation=expected_authority_generation,
+        on_mirror_error=_mirror_error,
+    )
+
+
+def _update_cache(
+    workspace: Path,
+    mutator: Callable[[dict[str, Any]], dict[str, Any] | None],
+    slot: str | None = None,
+) -> dict[str, Any]:
+    """Apply one read-modify-write transaction under the shared slot lock.
+
+    Returning ``None`` from ``mutator`` preserves the current cache without a
+    rewrite. The returned dict is always the payload that remains authoritative.
     """
-    path = workspace / CACHE_DIR / _slot_filename(slot)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        try:
-            os.write(fd, data)
-            os.fchmod(fd, 0o600)
-        finally:
-            os.close(fd)
-        os.replace(tmp, str(path))
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    authoritative, _committed = _update_cache_transaction(workspace, mutator, slot)
+    return authoritative
 
 
 # --- Response unwrap -------------------------------------------------------
@@ -292,6 +352,13 @@ def trajectory_required(parsed: dict) -> bool:
     return isinstance(recovery, dict) and recovery.get("reason") == "trajectory_required"
 
 
+def _identity_fingerprint(payload: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        str(payload.get(field) or "").strip()
+        for field in ("uuid", "agent_uuid", "agent_id", "client_session_id")
+    )
+
+
 # --- Core flow -------------------------------------------------------------
 
 def run_onboard(
@@ -330,7 +397,12 @@ def run_onboard(
     ``force_new`` still overrides the anchor as a deliberate break.
     """
     url = f"{server_url.rstrip('/')}/v1/tools/call"
-    cache = read_cache(workspace, slot)
+    native_cache_io = read_cache is _read_cache and write_cache is _write_cache
+    initial_generation: CacheGenerationToken | None = None
+    if native_cache_io:
+        cache, initial_generation = _read_cache_snapshot(workspace, slot)
+    else:
+        cache = read_cache(workspace, slot)
 
     # Resume-by-anchor vs. fresh-mint. Resume is continuity, NOT lineage: the
     # turns are the *same* agent resumed, so we send ``client_session_id``, OMIT
@@ -412,17 +484,50 @@ def run_onboard(
     if parent_agent_id:
         new_cache["parent_agent_id"] = parent_agent_id
         new_cache["spawn_reason"] = "new_session"
-    write_cache(workspace, new_cache, slot)
+
+    committed_fresh_identity = True
+    if native_cache_io:
+        initial_identity = _identity_fingerprint(cache)
+
+        def commit_if_unchanged(current: dict[str, Any]) -> dict[str, Any] | None:
+            if _identity_fingerprint(current) != initial_identity:
+                # Another host hook selected or cleared an identity while the
+                # network request was in flight. That newer local decision wins.
+                return None
+            return new_cache
+
+        authoritative, committed_fresh_identity = _update_cache_transaction(
+            workspace,
+            commit_if_unchanged,
+            slot,
+            expected_generation=initial_generation,
+        )
+        new_cache = authoritative
+    else:
+        # Preserve the injectable IO contract used by tests and embedders.
+        write_cache(workspace, new_cache, slot)
+
+    if not any(_identity_fingerprint(new_cache)):
+        return {
+            "status": "onboard_superseded",
+            "error": "session cache changed while onboarding; newer local state preserved",
+        }
 
     return {
         "status": "ok",
-        "uuid": new_cache["uuid"],
-        "agent_id": new_cache["agent_id"],
-        "client_session_id": new_cache["client_session_id"],
-        "continuity_token": parsed.get("continuity_token", ""),
-        "session_resolution_source": new_cache["session_resolution_source"],
-        "continuity_token_supported": parsed.get("continuity_token_supported", False),
-        "display_name": new_cache["display_name"],
+        "uuid": new_cache.get("uuid", ""),
+        "agent_id": new_cache.get("agent_id", ""),
+        "client_session_id": new_cache.get("client_session_id", ""),
+        "continuity_token": (
+            parsed.get("continuity_token", "") if committed_fresh_identity else ""
+        ),
+        "session_resolution_source": new_cache.get("session_resolution_source", ""),
+        "continuity_token_supported": (
+            parsed.get("continuity_token_supported", False)
+            if committed_fresh_identity
+            else False
+        ),
+        "display_name": new_cache.get("display_name", ""),
     }
 
 

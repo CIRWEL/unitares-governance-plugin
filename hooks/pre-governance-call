@@ -5,9 +5,25 @@
 # carry no identity arguments, so driver calls resolve at tier=strong instead
 # of through the displaceable IP:UA onboard pin. All policy lives in
 # scripts/governance_call_inject.py (suffix allowlist, minting-tool
-# exclusion, proof-field skip, fail-open). Never blocks, never decides
-# permissions — emits updatedInput only.
+# exclusion, proof-field skip, fail-open). Claude preserves its normal
+# permission flow; Codex explicitly allows rewritten UNITARES calls because
+# Codex otherwise discards updatedInput.
 set -uo pipefail
+
+HOOK_HOST="claude"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --host)
+      [[ $# -ge 2 ]] || exit 0
+      HOOK_HOST="$2"
+      shift 2
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+done
+[[ "${HOOK_HOST}" == "claude" || "${HOOK_HOST}" == "codex" ]] || exit 0
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -21,5 +37,76 @@ fi
 HELPER="${PLUGIN_ROOT}/scripts/governance_call_inject.py"
 [[ -f "${HELPER}" ]] || exit 0
 
-printf '%s' "${HOOK_INPUT}" | python3 "${HELPER}" 2>/dev/null || true
+# A manual check-in acknowledges the milestone revision that existed before
+# its MCP call started. PostToolUse consumes this tool-scoped snapshot; edits
+# from concurrent subagents that land while the call is in flight survive.
+CHECKIN_TOOL_USE_ID=$(python3 - "${HOOK_INPUT}" "${PLUGIN_ROOT}/scripts" "${HOOK_HOST}" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+sys.path.insert(0, sys.argv[2])
+
+from governance_tool_name import is_governance_tool
+
+try:
+    payload = json.loads(sys.argv[1])
+except Exception:
+    payload = {}
+tool_name = str(payload.get("tool_name") or "")
+tool_use_id = str(payload.get("tool_use_id") or payload.get("tool_call_id") or "")
+if is_governance_tool(
+    tool_name,
+    host=sys.argv[3],
+    suffixes={"process_agent_update", "sync_state"},
+):
+    print(tool_use_id)
+PY
+)
+IDENTITY_TOOL_USE_ID=$(python3 - "${HOOK_INPUT}" "${PLUGIN_ROOT}/scripts" "${HOOK_HOST}" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+sys.path.insert(0, sys.argv[2])
+
+from governance_tool_name import is_governance_tool
+
+try:
+    payload = json.loads(sys.argv[1])
+except Exception:
+    payload = {}
+tool_name = str(payload.get("tool_name") or "")
+tool_use_id = str(payload.get("tool_use_id") or payload.get("tool_call_id") or "")
+if is_governance_tool(
+    tool_name,
+    host=sys.argv[3],
+    suffixes={"onboard", "start_session", "identity", "bind_session"},
+):
+    print(tool_use_id)
+PY
+)
+SESSION_CACHE_HELPER="${PLUGIN_ROOT}/scripts/session_cache.py"
+SLOT_HELPER="${PLUGIN_ROOT}/scripts/_slot_from_stdin.py"
+HOOK_SLOT=""
+if [[ ( -n "${CHECKIN_TOOL_USE_ID}" || -n "${IDENTITY_TOOL_USE_ID}" ) \
+      && -f "${SLOT_HELPER}" ]]; then
+  HOOK_SLOT=$(printf '%s' "${HOOK_INPUT}" | python3 "${SLOT_HELPER}" 2>/dev/null || true)
+fi
+if [[ -n "${CHECKIN_TOOL_USE_ID}" \
+      && -n "${HOOK_SLOT}" \
+      && -f "${SESSION_CACHE_HELPER}" ]]; then
+  python3 "${SESSION_CACHE_HELPER}" snapshot-milestone \
+    --workspace "${PWD}" \
+    --event-id "${CHECKIN_TOOL_USE_ID}" \
+    --slot "${HOOK_SLOT}" >/dev/null 2>&1 || true
+fi
+if [[ -n "${IDENTITY_TOOL_USE_ID}" \
+      && -n "${HOOK_SLOT}" \
+      && -f "${SESSION_CACHE_HELPER}" ]]; then
+  python3 "${SESSION_CACHE_HELPER}" snapshot-session \
+    --workspace "${PWD}" \
+    --event-id "${IDENTITY_TOOL_USE_ID}" \
+    --slot "${HOOK_SLOT}" >/dev/null 2>&1 || true
+fi
+
+printf '%s' "${HOOK_INPUT}" | python3 "${HELPER}" --host "${HOOK_HOST}" 2>/dev/null || true
 exit 0

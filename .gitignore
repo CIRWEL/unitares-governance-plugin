@@ -1,6 +1,7 @@
 # Session cache (created at runtime by adapters/hooks)
 .claude/
 .unitares/
+.unitares-cache-authority/
 
 # Local git worktrees
 .worktrees/
@@ -8,6 +9,7 @@
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 
 # superpowers plugin planning artifacts

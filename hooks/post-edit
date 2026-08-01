@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# UNITARES Governance Plugin — PostToolUse hook (Edit/Write)
+# UNITARES Governance Plugin — host-specific PostToolUse edit hook
 #
 # Responsibilities (in order):
 #   1. Fan edit event out to an optional workspace-local watcher hook.
@@ -19,10 +19,12 @@
 #   UNITARES_AUTO_CHECKIN_EDITS=5     — fire after N edits since last checkin
 #   UNITARES_AUTO_CHECKIN_SECS=600    — fire after T seconds since last checkin
 #                                       (combined with edit_count >= 1)
-#   UNITARES_WATCHER_HOOK=<path>      — custom watcher hook path
-#   UNITARES_WATCHER_ENABLED=0        — disable watcher fan-out
+#   UNITARES_WATCHER_HOOK=<path>      — explicitly trusted watcher hook path
+#   UNITARES_WATCHER_ENABLED=1        — opt in to watcher fan-out
 #
-# Runs async — must never block or produce output on failure.
+# Claude runs this asynchronously and may auto-check in. Codex runs it
+# synchronously, so its path stops after bounded lease cleanup and a local
+# milestone update. Neither path produces user-visible output on failure.
 set -uo pipefail
 
 # ---------------------------------------------------------------------------
@@ -30,6 +32,14 @@ set -uo pipefail
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+HOOK_HOST="claude"
+if [[ "${1:-}" == "--host" && -n "${2:-}" ]]; then
+  HOOK_HOST="$2"
+fi
+if [[ "${HOOK_HOST}" != "claude" && "${HOOK_HOST}" != "codex" ]]; then
+  exit 0
+fi
 
 # Diagnostic breadcrumb (off by default). When UNITARES_HOOK_DEBUG=1, append
 # one line per silent-exit so operators can see where the chain breaks
@@ -87,20 +97,24 @@ fi
 # ---------------------------------------------------------------------------
 # Optional workspace-local watcher fan-out
 # ---------------------------------------------------------------------------
-WATCHER_HOOK="${UNITARES_WATCHER_HOOK:-${PWD}/agents/watcher/watcher-hook.sh}"
-if [[ "${UNITARES_WATCHER_ENABLED:-1}" != "0" && -x "${WATCHER_HOOK}" && -n "${HOOK_INPUT}" ]]; then
+WATCHER_HOOK="${UNITARES_WATCHER_HOOK:-}"
+if [[ "${HOOK_HOST}" == "claude" \
+      && "${UNITARES_WATCHER_ENABLED:-0}" == "1" \
+      && -n "${WATCHER_HOOK}" \
+      && -x "${WATCHER_HOOK}" \
+      && -n "${HOOK_INPUT}" ]]; then
   printf '%s' "${HOOK_INPUT}" | "${WATCHER_HOOK}" >/dev/null 2>&1 &
 fi
 
 # ---------------------------------------------------------------------------
-# Require the session cache helper + an active session to do anything else
+# Require the local cache helper before recording an edit milestone
 # ---------------------------------------------------------------------------
 if [[ -z "${SESSION_CACHE_HELPER}" ]]; then
   _breadcrumb no_session_cache_helper
   exit 0
 fi
 
-# Slot derivation (S20.1a): SLOT is strictly the Claude Code session_id
+# Slot derivation (S20.1a): SLOT is strictly the host session_id
 # from hook stdin. When stdin lacks session_id, the entire auto-checkin
 # pipeline is a full no-op: no checkin.py call, no milestone reset, and no
 # last_checkin_ts stamp. This avoids threshold flapping and prevents stale
@@ -116,18 +130,52 @@ if [[ -z "${SLOT}" ]]; then
   exit 0
 fi
 
-# Release the just-edited file's lease now that the write is done. A file
-# lease only needs to live for the duration of the edit that holds it;
-# releasing per-edit (instead of heartbeating until SessionEnd) means a
-# session that dies cannot strand a held lease — the immortal-lease class.
-# Independent of the auto-checkin path below; fire-and-forget.
+# Codex runs this hook synchronously, so it can release here. Claude runs the
+# separate synchronous post-edit-release handler alongside this asynchronous
+# milestone/check-in hook; keeping release out of the async path makes the
+# next Edit wait on deterministic cleanup rather than background work.
 FILE_LEASE_HELPER="${PLUGIN_ROOT}/scripts/file_lease_hook.py"
-if [[ -f "${FILE_LEASE_HELPER}" ]]; then
-  printf '%s' "${HOOK_INPUT}" | python3 "${FILE_LEASE_HELPER}" release-edit --workspace "${PWD}" >/dev/null 2>&1 || true
+if [[ "${HOOK_HOST}" == "codex" && -f "${FILE_LEASE_HELPER}" ]]; then
+  printf '%s' "${HOOK_INPUT}" | python3 "${FILE_LEASE_HELPER}" release-edit \
+    --workspace "${PWD}" --host "${HOOK_HOST}" >/dev/null 2>&1 || true
 fi
 
-# Resolve slot-aware session cache via shared helper. HOOK_INPUT already
-# captured from stdin above — its session_id field is the slot key.
+# ---------------------------------------------------------------------------
+# Normalize host-specific edit paths through the shared adapter contract
+# ---------------------------------------------------------------------------
+EDIT_EVENT_HELPER="${PLUGIN_ROOT}/scripts/edit_hook_event.py"
+if [[ ! -f "${EDIT_EVENT_HELPER}" ]]; then
+  _breadcrumb no_edit_event_helper
+  exit 0
+fi
+if ! FILE_PATHS_JSON=$(printf '%s' "${HOOK_INPUT}" | python3 "${EDIT_EVENT_HELPER}" \
+  --host "${HOOK_HOST}" --output paths 2>/dev/null); then
+  _breadcrumb "invalid_${HOOK_HOST}_edit_payload"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Bump the milestone accumulator (always — this is what /checkin summarizes)
+# ---------------------------------------------------------------------------
+MILESTONE_PAYLOAD=$(python3 "${SESSION_CACHE_HELPER}" \
+  bump-edit \
+  --workspace "${PWD}" \
+  --file-paths-json "${FILE_PATHS_JSON}" \
+  --echo 2>/dev/null || echo "{}")
+
+if [[ -z "${MILESTONE_PAYLOAD}" || "${MILESTONE_PAYLOAD}" == "{}" ]]; then
+  _breadcrumb bump_edit_failed
+  exit 0
+fi
+
+if [[ "${HOOK_HOST}" == "codex" ]]; then
+  _breadcrumb codex_local_only
+  exit 0
+fi
+
+# Claude's network-bearing auto-checkin path requires an established
+# slot-scoped governance identity. The local milestone above deliberately does
+# not: Codex commonly edits before Stop performs lazy onboarding.
 SESSION_LOOKUP="${PLUGIN_ROOT}/scripts/_session_lookup.py"
 if [[ -f "${SESSION_LOOKUP}" ]]; then
   # Load the full slotted session JSON for auto_checkin_decision, which needs
@@ -147,35 +195,6 @@ fi
 
 if [[ -z "${SESSION_PAYLOAD}" || "${SESSION_PAYLOAD}" == "{}" ]]; then
   _breadcrumb no_session_payload
-  exit 0
-fi
-
-# ---------------------------------------------------------------------------
-# Extract file_path from the Edit/Write tool payload
-# ---------------------------------------------------------------------------
-FILE_PATH=$(python3 - "${HOOK_INPUT}" <<'PY' 2>/dev/null || true
-import json, sys
-raw = sys.argv[1] if len(sys.argv) > 1 else ""
-try:
-    data = json.loads(raw) if raw else {}
-except Exception:
-    data = {}
-tool_input = data.get("tool_input", data.get("input", data))
-print(tool_input.get("file_path", tool_input.get("path", "")))
-PY
-)
-
-# ---------------------------------------------------------------------------
-# Bump the milestone accumulator (always — this is what /checkin summarizes)
-# ---------------------------------------------------------------------------
-MILESTONE_PAYLOAD=$(python3 "${SESSION_CACHE_HELPER}" \
-  bump-edit \
-  --workspace "${PWD}" \
-  --file-path "${FILE_PATH}" \
-  --echo 2>/dev/null || echo "{}")
-
-if [[ -z "${MILESTONE_PAYLOAD}" || "${MILESTONE_PAYLOAD}" == "{}" ]]; then
-  _breadcrumb bump_edit_failed
   exit 0
 fi
 
@@ -247,11 +266,47 @@ fi
 # no_session_payload exit.
 UUID_HINT="${UUID:-}"
 
-# NOTE: The previous inline curl supported UNITARES_HTTP_API_TOKEN as a Bearer
-# token; scripts/checkin.py does not (yet). Local deployments — the only
-# supported configuration today — do not use API-token auth, so this is not
-# a regression in practice. Add --bearer-token support to checkin.py if
-# token-authenticated governance endpoints are needed in the future.
+MILESTONE_REVISION=$(python3 -c "
+import json, sys
+try:
+    print(int(json.loads(sys.argv[1]).get('revision')))
+except Exception:
+    pass
+" "${MILESTONE_PAYLOAD}" 2>/dev/null || true)
+if [[ ! "${MILESTONE_REVISION}" =~ ^[0-9]+$ ]]; then
+  _breadcrumb delivery_missing_revision
+  exit 0
+fi
+
+# Claude can launch multiple asynchronous PostToolUse handlers together. Claim
+# one workspace-wide delivery slot before crossing the network so two edits
+# that cross the same threshold cannot both submit. The short expiry recovers
+# a hook killed before its owner-checked release runs.
+DELIVERY_OWNER="${HOOK_HOST}:${SLOT}:${MILESTONE_REVISION}:$$:${RANDOM:-0}"
+DELIVERY_CLAIM=$(python3 "${SESSION_CACHE_HELPER}" \
+  claim-milestone-delivery \
+  --workspace "${PWD}" \
+  --revision "${MILESTONE_REVISION}" \
+  --owner "${DELIVERY_OWNER}" \
+  --ttl "${UNITARES_AUTO_CHECKIN_CLAIM_TTL_S:-30}" \
+  --echo 2>/dev/null || echo "{}")
+DELIVERY_CLAIMED=$(python3 -c \
+  "import json,sys; print(json.loads(sys.argv[1]).get('claimed', False))" \
+  "${DELIVERY_CLAIM}" 2>/dev/null || echo "False")
+if [[ "${DELIVERY_CLAIMED}" != "True" ]]; then
+  _breadcrumb auto_checkin_already_in_flight
+  exit 0
+fi
+
+_release_delivery_claim() {
+  python3 "${SESSION_CACHE_HELPER}" \
+    release-milestone-delivery \
+    --workspace "${PWD}" \
+    --owner "${DELIVERY_OWNER}" >/dev/null 2>&1 || true
+}
+trap _release_delivery_claim EXIT
+
+# scripts/checkin.py forwards UNITARES_HTTP_API_TOKEN as a Bearer token when set.
 python3 "${PLUGIN_ROOT}/scripts/checkin.py" \
   --event auto_edit \
   --response-text "${RESPONSE_TEXT}" \
@@ -261,15 +316,22 @@ python3 "${PLUGIN_ROOT}/scripts/checkin.py" \
   --client-session-id "${CLIENT_SESSION_ID}" \
   --uuid "${UUID_HINT}" \
   --slot "${SLOT}" \
-  >/dev/null 2>&1 || true
+  --require-delivery \
+  >/dev/null 2>&1
+CHECKIN_STATUS=$?
+if [[ "${CHECKIN_STATUS}" -ne 0 ]]; then
+  _breadcrumb "auto_checkin_not_delivered status=${CHECKIN_STATUS}"
+  exit 0
+fi
 
-# Reset the accumulator + stamp last_checkin_ts. checkin.py logs success/fail
-# locally; from the hook's perspective the attempt is fire-and-forget — we
-# always reset so the next edit starts a fresh accumulator window rather than
-# double-firing on counters that may already have been committed server-side.
+# Reset the accumulator + stamp last_checkin_ts only after checkin.py confirms
+# delivery. If another subagent bumped the shared
+# milestone while the check-in was in flight, the revision mismatch preserves
+# that newer edit for the next turn instead of silently erasing it.
 python3 "${SESSION_CACHE_HELPER}" \
   reset-milestone \
-  --workspace "${PWD}" >/dev/null 2>&1 || true
+  --workspace "${PWD}" \
+  --expected-revision "${MILESTONE_REVISION}" >/dev/null 2>&1 || true
 
 NOW_EPOCH=$(python3 -c "import time; print(int(time.time()))")
 # Slot-scoped milestone-timestamp write (S20.1a). Without --slot the helper

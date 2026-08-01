@@ -23,14 +23,15 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from _http_auth import authorization_safe_urlopen, governance_json_headers
 from _redact import redact_secrets
 
 DEFAULT_SERVER_URL = "http://localhost:8767"
 DEFAULT_LOG_PATH = "~/.unitares/checkins.log"
-DEFAULT_PLUGIN_VERSION = "0.4.10"
-# process_agent_update can take 5–10s under the anyio-asyncio mitigation
-# paths in governance_core. 20s gives headroom without wedging Claude
-# turns for absurd lengths when governance is genuinely hung.
+DEFAULT_PLUGIN_VERSION = "0.4.12"
+# process_agent_update can take 5-10s under the anyio-asyncio mitigation
+# paths in governance_core. 20s is the default; synchronous hosts may pass a
+# smaller timeout so the request fits inside their outer hook deadline.
 POST_TIMEOUT_SEC = 20.0
 RESPONSE_TEXT_MAX = 512
 
@@ -115,13 +116,62 @@ def _post_to_governance(
     req = urllib.request.Request(
         f"{url}/v1/tools/call",
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=governance_json_headers(),
     )
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            resp.read()  # drain
+        with authorization_safe_urlopen(req, timeout=timeout) as resp:
+            raw_response = resp.read()
         latency_ms = int((time.monotonic() - t0) * 1000)
+        try:
+            response = json.loads(raw_response.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return False, latency_ms, f"invalid governance response: {exc}"
+
+        def explicit_success(value: object, depth: int = 0) -> Optional[bool]:
+            if depth > 5:
+                return None
+            if isinstance(value, list):
+                verdicts = [explicit_success(item, depth + 1) for item in value]
+                if False in verdicts:
+                    return False
+                return True if True in verdicts else None
+            if not isinstance(value, dict):
+                return None
+            if value.get("isError") is True:
+                return False
+            current = value.get("success")
+            if current is False:
+                return False
+            nested_verdicts: list[Optional[bool]] = []
+            for key in ("result", "structuredContent", "content"):
+                if key in value:
+                    nested_verdicts.append(explicit_success(value[key], depth + 1))
+            text = value.get("text")
+            if isinstance(text, str):
+                try:
+                    nested_verdicts.append(
+                        explicit_success(json.loads(text), depth + 1)
+                    )
+                except json.JSONDecodeError:
+                    pass
+            if False in nested_verdicts:
+                return False
+            if current is True or True in nested_verdicts:
+                return True
+            return None
+
+        verdict = explicit_success(response)
+        if verdict is not True:
+            error = "governance response did not confirm success"
+            if isinstance(response, dict):
+                nested = response.get("result")
+                detail = response.get("error")
+                if not detail and isinstance(nested, dict):
+                    detail = nested.get("error")
+                if detail:
+                    error = str(detail)
+            return False, latency_ms, error
         return True, latency_ms, None
     except urllib.error.URLError as e:
         latency_ms = int((time.monotonic() - t0) * 1000)
@@ -144,6 +194,7 @@ def submit_checkin(
     server_url: Optional[str] = None,
     plugin_version: Optional[str] = None,
     epistemic_class: Optional[str] = None,
+    timeout: Optional[float] = None,
 ) -> str:
     """Send one check-in. Returns a status string suitable for logging."""
     if _is_killed():
@@ -169,7 +220,14 @@ def submit_checkin(
             "name": "process_agent_update",
             "arguments": arguments,
         }
-        ok, latency_ms, err = _post_to_governance(url, payload)
+        if timeout is None:
+            ok, latency_ms, err = _post_to_governance(url, payload)
+        else:
+            ok, latency_ms, err = _post_to_governance(
+                url,
+                payload,
+                timeout=max(0.1, float(timeout)),
+            )
         status = "sent" if ok else "fail"
         _append_log(
             slot=slot, event=event, uuid=uuid, status=status,
@@ -203,6 +261,12 @@ def _cli() -> int:
     p.add_argument("--server-url", default=None)
     p.add_argument("--plugin-version", default=None)
     p.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="HTTP timeout in seconds; defaults to the helper's 20-second budget.",
+    )
+    p.add_argument(
         "--epistemic-class",
         default=None,
         choices=[
@@ -212,6 +276,11 @@ def _cli() -> int:
             "prediction",
         ],
         help="Optional process_agent_update epistemic_class label.",
+    )
+    p.add_argument(
+        "--require-delivery",
+        action="store_true",
+        help="Return nonzero when the check-in kill switch skips delivery.",
     )
     args = p.parse_args()
 
@@ -227,8 +296,13 @@ def _cli() -> int:
         server_url=args.server_url,
         plugin_version=args.plugin_version,
         epistemic_class=args.epistemic_class,
+        timeout=args.timeout,
     )
-    return 0 if status in ("sent", "skip_kill_switch") else 1
+    if status == "sent":
+        return 0
+    if status == "skip_kill_switch" and not args.require_delivery:
+        return 0
+    return 1
 
 
 if __name__ == "__main__":

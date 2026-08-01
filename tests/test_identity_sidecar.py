@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import threading
 import urllib.request
@@ -16,6 +17,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import identity_sidecar  # noqa: E402
+import session_cache  # noqa: E402
 from identity_sidecar import IdentitySidecar, make_handler  # noqa: E402
 
 
@@ -201,6 +204,100 @@ def test_tool_proxy_lazy_onboards_and_injects_client_session_id(tmp_path: Path, 
     cache = json.loads((tmp_path / ".unitares" / "session-slot-a.json").read_text())
     assert cache["client_session_id"] == "agent-sidecar-111"
     assert "continuity_token" not in cache
+
+
+def test_concurrent_ensure_session_is_single_flight(
+    tmp_path: Path,
+    fake_server: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    sidecar = _sidecar(tmp_path, fake_server)
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def blocked_onboard(**kwargs):
+        nonlocal calls
+        calls += 1
+        started.set()
+        assert release.wait(timeout=5)
+        payload = {
+            "uuid": "11111111-2222-4333-8444-555555555555",
+            "client_session_id": "agent-single-flight",
+        }
+        sidecar.write_session("slot-a", payload)
+        return {"status": "ok", **payload}
+
+    monkeypatch.setattr(identity_sidecar, "run_onboard", blocked_onboard)
+    results: list[dict] = []
+    workers = [
+        threading.Thread(target=lambda: results.append(sidecar.ensure_session("slot-a")))
+        for _ in range(2)
+    ]
+    workers[0].start()
+    assert started.wait(timeout=5)
+    workers[1].start()
+    release.set()
+    for worker in workers:
+        worker.join(timeout=5)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert calls == 1
+    assert len(results) == 2
+    assert {result["client_session_id"] for result in results} == {
+        "agent-single-flight"
+    }
+
+
+def test_clear_supersedes_inflight_sidecar_identity_response(
+    tmp_path: Path,
+    fake_server: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    sidecar = _sidecar(tmp_path, fake_server)
+    started = threading.Event()
+    release = threading.Event()
+    result: list[tuple[int, dict]] = []
+
+    def blocked_post(*_args, **_kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        return (
+            {
+                "result": {
+                    "success": True,
+                    "uuid": "99999999-2222-4333-8444-555555555555",
+                    "client_session_id": "agent-too-late",
+                }
+            },
+            1,
+            None,
+        )
+
+    monkeypatch.setattr(identity_sidecar, "_post_json", blocked_post)
+    worker = threading.Thread(
+        target=lambda: result.append(
+            sidecar.tool_call({"name": "onboard", "arguments": {}}, headers={})
+        )
+    )
+    worker.start()
+    assert started.wait(timeout=5)
+    assert session_cache.cmd_clear(
+        argparse.Namespace(kind="session", workspace=str(tmp_path), slot="slot-a")
+    ) == 0
+    release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert result[0][0] == 200
+    assert sidecar.read_session("slot-a") == {}
+    assert not (fake_home / ".unitares" / "session-slot-a.json").exists()
 
 
 def test_turn_checkin_lazy_onboards_then_sends_real_checkin(tmp_path: Path, fake_server: str) -> None:

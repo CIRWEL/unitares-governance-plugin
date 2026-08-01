@@ -24,6 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SESSION_CACHE = ROOT / "scripts" / "session_cache.py"
 POST_CHECKIN = ROOT / "hooks" / "post-checkin"
+PRE_GOVERNANCE_CALL = ROOT / "hooks" / "pre-governance-call"
 
 
 def _seed_session(workspace: Path, slot: str | None = None, **extra) -> None:
@@ -87,10 +88,23 @@ def _run_hook(
     workspace: Path,
     tool_name: str = "mcp__unitares__process_agent_update",
     session_id: str | None = None,
+    tool_use_id: str | None = None,
+    tool_response: object | None = None,
 ):
-    payload_dict = {"tool_name": tool_name, "tool_input": {}}
+    success_response = {
+        "content": [
+            {"type": "text", "text": json.dumps({"success": True})}
+        ]
+    }
+    payload_dict = {
+        "tool_name": tool_name,
+        "tool_input": {},
+        "tool_response": tool_response if tool_response is not None else success_response,
+    }
     if session_id is not None:
         payload_dict["session_id"] = session_id
+    if tool_use_id is not None:
+        payload_dict["tool_use_id"] = tool_use_id
     payload = json.dumps(payload_dict)
     return subprocess.run(
         ["bash", str(POST_CHECKIN)],
@@ -101,10 +115,33 @@ def _run_hook(
     )
 
 
+def _run_pre_hook(
+    workspace: Path,
+    session_id: str,
+    tool_use_id: str,
+    tool_name: str = "mcp__unitares__process_agent_update",
+):
+    payload = json.dumps(
+        {
+            "session_id": session_id,
+            "tool_name": tool_name,
+            "tool_use_id": tool_use_id,
+            "tool_input": {"response_text": "manual check-in"},
+        }
+    )
+    return subprocess.run(
+        ["bash", str(PRE_GOVERNANCE_CALL)],
+        input=payload,
+        text=True,
+        cwd=str(workspace),
+        capture_output=True,
+    )
+
+
 SLOT = "claude-session-abc-123"
 
 
-def test_hook_resets_accumulator_and_stamps_last_checkin(tmp_path: Path) -> None:
+def test_idless_hook_preserves_accumulator_and_stamps_last_checkin(tmp_path: Path) -> None:
     _seed_session(tmp_path, slot=SLOT)
     _seed_milestone_edits(tmp_path, 3)
 
@@ -117,14 +154,28 @@ def test_hook_resets_accumulator_and_stamps_last_checkin(tmp_path: Path) -> None
     assert result.returncode == 0, result.stderr
 
     after_milestone = _read("milestone", tmp_path)
-    assert after_milestone["edit_count"] == 0
-    assert after_milestone["files_touched"] == []
-    assert after_milestone["first_edit_ts"] is None
-    assert after_milestone["last_edit_ts"] is None
+    assert after_milestone["edit_count"] == 3
+    assert after_milestone["files_touched"]
+    assert after_milestone["first_edit_ts"] is not None
+    assert after_milestone["last_edit_ts"] is not None
 
     after_session = _read("session", tmp_path, slot=SLOT)
     assert "last_checkin_ts" in after_session
     assert int(after_session["last_checkin_ts"]) >= before_ts
+
+
+def test_correlated_hook_resets_snapshot_without_newer_edits(tmp_path: Path) -> None:
+    _seed_session(tmp_path, slot=SLOT)
+    _seed_milestone_edits(tmp_path, 2)
+    tool_use_id = "toolu_correlated_success"
+    pre = _run_pre_hook(tmp_path, SLOT, tool_use_id)
+    assert pre.returncode == 0, pre.stderr
+
+    result = _run_hook(tmp_path, session_id=SLOT, tool_use_id=tool_use_id)
+
+    assert result.returncode == 0, result.stderr
+    assert _read("milestone", tmp_path)["edit_count"] == 0
+    assert list((tmp_path / ".unitares" / "milestone-snapshots").glob("*.json")) == []
 
 
 def test_hook_is_noop_without_session(tmp_path: Path) -> None:
@@ -134,6 +185,57 @@ def test_hook_is_noop_without_session(tmp_path: Path) -> None:
     result = _run_hook(tmp_path, session_id=SLOT)
     assert result.returncode == 0, result.stderr
     assert not (tmp_path / ".unitares").exists()
+
+
+def test_failed_checkin_without_session_discards_snapshot(tmp_path: Path) -> None:
+    _seed_milestone_edits(tmp_path, 1)
+    tool_use_id = "toolu_no_session_failure"
+    pre = _run_pre_hook(tmp_path, SLOT, tool_use_id)
+    assert pre.returncode == 0, pre.stderr
+    snapshots = tmp_path / ".unitares" / "milestone-snapshots"
+    assert len(list(snapshots.glob("*.json"))) == 1
+
+    post = _run_hook(
+        tmp_path,
+        session_id=SLOT,
+        tool_use_id=tool_use_id,
+        tool_response={"success": False, "error": "denied"},
+    )
+
+    assert post.returncode == 0, post.stderr
+    assert list(snapshots.glob("*.json")) == []
+    assert _read("milestone", tmp_path)["edit_count"] == 1
+
+
+def test_pre_hook_does_not_snapshot_non_governance_checkin(tmp_path: Path) -> None:
+    _seed_milestone_edits(tmp_path, 1)
+
+    pre = _run_pre_hook(
+        tmp_path,
+        SLOT,
+        "toolu_fake_checkin",
+        tool_name="mcp__fake__sync_state",
+    )
+
+    assert pre.returncode == 0, pre.stderr
+    snapshots = tmp_path / ".unitares" / "milestone-snapshots"
+    assert not snapshots.exists() or list(snapshots.glob("*.json")) == []
+
+
+def test_post_hook_does_not_acknowledge_non_governance_checkin(tmp_path: Path) -> None:
+    _seed_session(tmp_path, slot=SLOT)
+    _seed_milestone_edits(tmp_path, 2)
+
+    post = _run_hook(
+        tmp_path,
+        tool_name="mcp__fake__process_agent_update",
+        session_id=SLOT,
+        tool_use_id="toolu_fake_checkin",
+    )
+
+    assert post.returncode == 0, post.stderr
+    assert _read("milestone", tmp_path)["edit_count"] == 2
+    assert "last_checkin_ts" not in _read("session", tmp_path, slot=SLOT)
 
 
 def test_hook_updates_last_checkin_on_each_call(tmp_path: Path) -> None:
@@ -152,6 +254,60 @@ def test_hook_updates_last_checkin_on_each_call(tmp_path: Path) -> None:
     _run_hook(tmp_path, session_id=SLOT)
     second = _read("session", tmp_path, slot=SLOT)["last_checkin_ts"]
     assert int(second) >= int(first)
+
+
+def test_hook_preserves_edit_made_during_manual_checkin(tmp_path: Path) -> None:
+    _seed_session(tmp_path, slot=SLOT)
+    _seed_milestone_edits(tmp_path, 1)
+    tool_use_id = "toolu_manual_race"
+
+    pre = _run_pre_hook(tmp_path, SLOT, tool_use_id)
+    assert pre.returncode == 0, pre.stderr
+    assert len(list((tmp_path / ".unitares" / "milestone-snapshots").glob("*.json"))) == 1
+
+    _seed_milestone_edits(tmp_path, 1)
+    post = _run_hook(tmp_path, session_id=SLOT, tool_use_id=tool_use_id)
+    assert post.returncode == 0, post.stderr
+
+    milestone = _read("milestone", tmp_path)
+    assert milestone["edit_count"] == 2
+    assert list((tmp_path / ".unitares" / "milestone-snapshots").glob("*.json")) == []
+
+
+def test_failed_checkin_preserves_milestone_and_timestamp(tmp_path: Path) -> None:
+    _seed_session(tmp_path, slot=SLOT, last_checkin_ts=1_000_000_000)
+    _seed_milestone_edits(tmp_path, 2)
+    tool_use_id = "toolu_failed_checkin"
+    pre = _run_pre_hook(tmp_path, SLOT, tool_use_id)
+    assert pre.returncode == 0, pre.stderr
+
+    post = _run_hook(
+        tmp_path,
+        session_id=SLOT,
+        tool_use_id=tool_use_id,
+        tool_response={"success": False, "error": "rejected"},
+    )
+
+    assert post.returncode == 0, post.stderr
+    milestone = _read("milestone", tmp_path)
+    assert milestone["edit_count"] == 2
+    assert _read("session", tmp_path, slot=SLOT)["last_checkin_ts"] == 1_000_000_000
+    assert list((tmp_path / ".unitares" / "milestone-snapshots").glob("*.json")) == []
+
+
+def test_outer_success_cannot_mask_nested_checkin_failure(tmp_path: Path) -> None:
+    _seed_session(tmp_path, slot=SLOT, last_checkin_ts=1_000_000_000)
+    _seed_milestone_edits(tmp_path, 1)
+
+    post = _run_hook(
+        tmp_path,
+        session_id=SLOT,
+        tool_response={"success": True, "result": {"success": False}},
+    )
+
+    assert post.returncode == 0, post.stderr
+    assert _read("milestone", tmp_path)["edit_count"] == 1
+    assert _read("session", tmp_path, slot=SLOT)["last_checkin_ts"] == 1_000_000_000
 
 
 def test_hook_does_not_write_flat_session_when_slot_known(tmp_path: Path) -> None:

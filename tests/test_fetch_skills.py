@@ -14,14 +14,13 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import subprocess
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 
@@ -51,7 +50,13 @@ class MockHandler(BaseHTTPRequestHandler):
             parsed = json.loads(body) if body else {}
         except Exception:
             parsed = {"_raw": body}
-        type(self).requests.append({"path": self.path, "body": parsed})
+        type(self).requests.append(
+            {
+                "path": self.path,
+                "body": parsed,
+                "headers": {key.lower(): value for key, value in self.headers.items()},
+            }
+        )
 
         if type(self).delay_before_response:
             time.sleep(type(self).delay_before_response)
@@ -187,6 +192,21 @@ def test_fresh_server_fetch_renders_frontmatter_and_body(
     assert req["path"] == "/v1/tools/call"
     assert req["body"]["name"] == "skills"
     assert req["body"]["arguments"]["name"] == "governance-fundamentals"
+
+
+def test_fresh_server_fetch_forwards_http_api_token(
+    mock_server, isolated_cache, fake_plugin_root, monkeypatch
+):
+    monkeypatch.setenv("UNITARES_HTTP_API_TOKEN", "skills-secret")
+    MockHandler.response_payload = _server_response()
+
+    result = _run(plugin_root=fake_plugin_root, server_url=mock_server["url"])
+
+    assert result.returncode == 0
+    assert len(MockHandler.requests) == 1
+    assert MockHandler.requests[0]["headers"]["authorization"] == (
+        "Bearer skills-secret"
+    )
 
 
 def test_fresh_fetch_writes_cache_at_mode_0600(

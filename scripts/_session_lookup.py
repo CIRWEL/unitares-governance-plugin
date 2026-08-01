@@ -24,9 +24,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 from typing import Any, Optional
+
+from _session_cache_io import home_session_mirror_is_valid
 
 CACHE_FILE = "session.json"
 
@@ -95,13 +96,19 @@ def resolve_session_file(workspace: str | Path, slot: Optional[str]) -> Optional
         return None
     unitares_dir = Path(workspace) / ".unitares"
     slotted = unitares_dir / _slot_filename(slot)
+    home_slotted = Path.home() / ".unitares" / _slot_filename(slot)
     if slotted.exists():
+        normalized_slotted = slotted.parent.resolve() / slotted.name
+        normalized_home = home_slotted.parent.resolve() / home_slotted.name
+        if normalized_slotted == normalized_home and not home_session_mirror_is_valid(
+            home_slotted
+        ):
+            return None
         return slotted
     # Slotted HOME fallback. Only fires when a slot key is present — the
     # slot is per-Claude-session unique, so cross-agent siphoning is
     # structurally precluded (cf. unslotted-HOME removal above).
-    home_slotted = Path.home() / ".unitares" / _slot_filename(slot)
-    if home_slotted.exists():
+    if home_slotted.exists() and home_session_mirror_is_valid(home_slotted):
         return home_slotted
     return None
 

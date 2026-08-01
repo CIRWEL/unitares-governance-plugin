@@ -38,14 +38,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from audit_identity_contract import audit_checkin_log, audit_session_caches, parse_since  # noqa: E402
 from checkin import _plugin_version, submit_checkin  # noqa: E402
 from governance_call_inject import INJECT_SUFFIXES, PROOF_FIELDS  # noqa: E402
+from _http_auth import authorization_safe_urlopen  # noqa: E402
 from _redact import sanitize_model_visible_payload  # noqa: E402
 from onboard_helper import (  # noqa: E402
+    CacheGenerationToken,
     DEFAULT_SERVER_URL,
+    _cache_path,
     _read_cache,
+    _read_cache_snapshot,
+    _update_cache,
+    _update_cache_transaction,
     _write_cache,
     run_onboard,
     unwrap_tool_response,
 )
+from _session_cache_io import session_cache_lock  # noqa: E402
 
 
 IDENTITY_TOOL_NAMES = {"onboard", "start_session", "identity", "bind_session"}
@@ -119,7 +126,7 @@ def _post_json(url: str, payload: dict[str, Any], timeout: float, token: str | N
         req.add_header("Authorization", f"Bearer {token}")
     started = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with authorization_safe_urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
     except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
         return {}, int((time.monotonic() - started) * 1000), str(getattr(exc, "reason", exc))
@@ -144,7 +151,7 @@ def _post_json_any(
         req.add_header("Authorization", f"Bearer {token}")
     started = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with authorization_safe_urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
             status = int(resp.status)
     except urllib.error.HTTPError as exc:
@@ -206,67 +213,120 @@ class IdentitySidecar:
         _write_cache(self.workspace, clean, slot)
 
     def stamp_session(self, slot: str) -> None:
-        session = self.read_session(slot)
-        if not session:
-            return
-        session.pop("continuity_token", None)
-        session.setdefault("schema_version", 2)
-        session["last_checkin_ts"] = int(time.time())
-        session["updated_at"] = _now_iso()
-        _write_cache(self.workspace, session, slot)
+        def stamp(session: dict[str, Any]) -> dict[str, Any] | None:
+            if not session:
+                return None
+            session.pop("continuity_token", None)
+            session.setdefault("schema_version", 2)
+            session["last_checkin_ts"] = int(time.time())
+            session["updated_at"] = _now_iso()
+            return session
+
+        _update_cache(self.workspace, stamp, slot)
 
     def ensure_session(self, slot: str) -> dict[str, Any]:
-        session = self.read_session(slot)
-        sid = session.get("client_session_id")
-        if isinstance(sid, str) and sid.strip():
-            return {
-                "status": "cached",
-                "uuid": session.get("uuid", ""),
-                "client_session_id": sid.strip(),
-                "session": session,
-            }
-        result = run_onboard(
-            server_url=self.server_url,
-            agent_name=self.agent_name,
-            model_type=self.model_type,
-            workspace=self.workspace,
-            slot=slot,
-            force_new=False,
-            auth_token=self.auth_token,
-            timeout=self.timeout,
+        # The HTTP server is threaded. A distinct stable lock prevents two
+        # processes or threads from both minting an upstream identity for the
+        # same empty slot while leaving ordinary cache/clear transactions free.
+        onboard_claim = _cache_path(self.workspace, slot).with_name(
+            f"{_cache_path(self.workspace, slot).name}.onboard"
         )
+        try:
+            with session_cache_lock(onboard_claim):
+                session = self.read_session(slot)
+                sid = session.get("client_session_id")
+                if isinstance(sid, str) and sid.strip():
+                    return {
+                        "status": "cached",
+                        "uuid": session.get("uuid", ""),
+                        "client_session_id": sid.strip(),
+                        "session": session,
+                    }
+                result = run_onboard(
+                    server_url=self.server_url,
+                    agent_name=self.agent_name,
+                    model_type=self.model_type,
+                    workspace=self.workspace,
+                    slot=slot,
+                    force_new=False,
+                    auth_token=self.auth_token,
+                    timeout=self.timeout,
+                )
+        except TimeoutError:
+            return {
+                "status": "onboard_in_progress",
+                "error": "another sidecar request is onboarding this slot",
+            }
         if result.get("status") != "ok":
             return result
         # run_onboard writes the cache; add schema/stamp fields for the sidecar
         # contract without persisting the transient continuity_token.
-        session = self.read_session(slot)
-        if session:
+        def stamp_schema(session: dict[str, Any]) -> dict[str, Any] | None:
+            if not session:
+                return None
             session.setdefault("schema_version", 2)
             session["updated_at"] = _now_iso()
-            _write_cache(self.workspace, session, slot)
-        result["session"] = self.read_session(slot)
+            return session
+
+        result["session"] = _update_cache(self.workspace, stamp_schema, slot)
+        current_sid = str(result["session"].get("client_session_id") or "").strip()
+        if not current_sid or current_sid != str(result.get("client_session_id") or "").strip():
+            return {
+                "status": "onboard_superseded",
+                "error": "session cache changed after onboarding; newer local state preserved",
+            }
         return result
 
-    def update_cache_from_identity_response(self, slot: str, parsed: dict[str, Any]) -> None:
+    def update_cache_from_identity_response(
+        self,
+        slot: str,
+        parsed: dict[str, Any],
+        *,
+        expected_generation: CacheGenerationToken | None = None,
+    ) -> None:
         if not isinstance(parsed, dict):
             return
-        uuid = parsed.get("uuid") or parsed.get("agent_uuid")
-        sid = parsed.get("client_session_id")
+        canonical = parsed.get("raw_governance")
+        if not isinstance(canonical, dict):
+            canonical = {}
+        uuid = (
+            parsed.get("uuid")
+            or parsed.get("agent_uuid")
+            or canonical.get("uuid")
+            or canonical.get("agent_uuid")
+        )
+        sid = parsed.get("client_session_id") or canonical.get("client_session_id")
         if not uuid and not sid:
             return
-        existing = self.read_session(slot)
-        payload: dict[str, Any] = {
-            "server_url": self.server_url,
-            "agent_name": self.agent_name,
-            "slot": slot,
-            "uuid": uuid or existing.get("uuid", ""),
-            "agent_id": parsed.get("agent_id") or parsed.get("resolved_agent_id") or existing.get("agent_id", ""),
-            "client_session_id": sid or existing.get("client_session_id", ""),
-            "session_resolution_source": parsed.get("session_resolution_source") or existing.get("session_resolution_source", ""),
-            "display_name": parsed.get("display_name") or existing.get("display_name", ""),
-            "schema_version": 2,
-        }
-        self.write_session(slot, payload)
+        def merge_identity(existing: dict[str, Any]) -> dict[str, Any]:
+            payload: dict[str, Any] = {
+                "server_url": self.server_url,
+                "agent_name": self.agent_name,
+                "slot": slot,
+                "uuid": uuid or existing.get("uuid", ""),
+                "agent_id": parsed.get("agent_id")
+                or parsed.get("resolved_agent_id")
+                or canonical.get("agent_id")
+                or canonical.get("resolved_agent_id")
+                or existing.get("agent_id", ""),
+                "client_session_id": sid or existing.get("client_session_id", ""),
+                "session_resolution_source": parsed.get("session_resolution_source")
+                or canonical.get("session_resolution_source")
+                or existing.get("session_resolution_source", ""),
+                "display_name": parsed.get("display_name")
+                or canonical.get("display_name")
+                or existing.get("display_name", ""),
+                "schema_version": 2,
+                "updated_at": _now_iso(),
+            }
+            return payload
+
+        _update_cache_transaction(
+            self.workspace,
+            merge_identity,
+            slot,
+            expected_generation=expected_generation,
+        )
 
     def prepare_tool_arguments(
         self,
@@ -291,12 +351,23 @@ class IdentitySidecar:
                 lifecycle["session_proof_injected"] = True
         return arguments, lifecycle
 
-    def process_tool_response(self, *, name: str, slot: str, raw: Any) -> None:
+    def process_tool_response(
+        self,
+        *,
+        name: str,
+        slot: str,
+        raw: Any,
+        identity_generation: CacheGenerationToken | None = None,
+    ) -> None:
         if not isinstance(raw, dict):
             return
         parsed = unwrap_tool_response(raw)
         if name in IDENTITY_TOOL_NAMES:
-            self.update_cache_from_identity_response(slot, parsed)
+            self.update_cache_from_identity_response(
+                slot,
+                parsed,
+                expected_generation=identity_generation,
+            )
         if name in CHECKIN_TOOL_NAMES:
             self.stamp_session(slot)
 
@@ -316,6 +387,9 @@ class IdentitySidecar:
             arguments=arguments,
             slot=slot,
         )
+        identity_generation = None
+        if name in IDENTITY_TOOL_NAMES:
+            _session, identity_generation = _read_cache_snapshot(self.workspace, slot)
 
         upstream_payload = {"name": name, "arguments": arguments}
         raw, latency_ms, error = _post_json(
@@ -331,7 +405,12 @@ class IdentitySidecar:
                 "sidecar": lifecycle | {"upstream_latency_ms": latency_ms},
             })
 
-        self.process_tool_response(name=name, slot=slot, raw=raw)
+        self.process_tool_response(
+            name=name,
+            slot=slot,
+            raw=raw,
+            identity_generation=identity_generation,
+        )
 
         raw.setdefault("sidecar", {})
         if isinstance(raw["sidecar"], dict):
@@ -355,7 +434,7 @@ class IdentitySidecar:
                 "error": {"code": -32600, "message": "invalid JSON-RPC request"},
             }
 
-        metadata_by_id: dict[Any, tuple[str, dict[str, Any]]] = {}
+        metadata_by_id: dict[Any, tuple[str, dict[str, Any], int | None]] = {}
         mutated: list[dict[str, Any]] = []
         for item in requests:
             req = dict(item)
@@ -373,7 +452,17 @@ class IdentitySidecar:
                         new_params = dict(params)
                         new_params["arguments"] = prepared
                         req["params"] = new_params
-                        metadata_by_id[req.get("id")] = (name, lifecycle)
+                        identity_generation = None
+                        if name in IDENTITY_TOOL_NAMES:
+                            _session, identity_generation = _read_cache_snapshot(
+                                self.workspace,
+                                slot,
+                            )
+                        metadata_by_id[req.get("id")] = (
+                            name,
+                            lifecycle,
+                            identity_generation,
+                        )
             mutated.append(req)
 
         outbound: Any = mutated if isinstance(body, list) else mutated[0]
@@ -401,8 +490,13 @@ class IdentitySidecar:
             meta = metadata_by_id.get(response.get("id"))
             if not meta:
                 continue
-            name, _lifecycle = meta
-            self.process_tool_response(name=name, slot=slot, raw=response)
+            name, _lifecycle, identity_generation = meta
+            self.process_tool_response(
+                name=name,
+                slot=slot,
+                raw=response,
+                identity_generation=identity_generation,
+            )
         return status, sanitize_model_visible_payload(upstream)
 
     def turn_checkin(self, body: dict[str, Any], headers: Any) -> tuple[int, dict[str, Any]]:

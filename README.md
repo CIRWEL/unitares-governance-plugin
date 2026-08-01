@@ -3,7 +3,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Claude Code Plugin](https://img.shields.io/badge/Claude%20Code-plugin-d97757.svg)](https://docs.claude.com/en/docs/claude-code/plugins)
 [![Codex Plugin](https://img.shields.io/badge/Codex-plugin-10a37f.svg)](./CODEX_START.md)
-[![Version](https://img.shields.io/badge/version-0.4.10-blue.svg)](.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.4.12-blue.svg)](.claude-plugin/plugin.json)
 
 Client/plugin integration layer for **UNITARES** — the runtime governance layer for heterogeneous AI-agent fleets. This repo provides Claude/Codex-facing skills, command guidance, hook scripts, and sidecar tooling for connecting coding agents to a running UNITARES governance server. The runtime itself lives in [`cirwel/unitares`](https://github.com/cirwel/unitares); Hermes-native lifecycle bindings live in [`cirwel/unitares-host-adapter`](https://github.com/cirwel/unitares-host-adapter).
 
@@ -23,10 +23,19 @@ reachable at `http://localhost:8767`, or at the base URL configured through
 `UNITARES_SERVER_URL`; see [Prerequisites](#prerequisites). Codex and ChatGPT
 users should start with [CODEX_START.md](./CODEX_START.md).
 
-For Codex CLI, add the marketplace with
+Current Claude Code hook payloads scope this plugin-bundled server as
+`plugin_unitares-governance_unitares-governance`, producing tool names such as
+`mcp__plugin_unitares-governance_unitares-governance__sync_state`. Codex uses
+the bare `mcp__unitares-governance__sync_state` form instead.
+
+Host contracts are tested with Claude Code 2.1.220 and Codex CLI 0.146.0;
+these are the minimum tested versions. Add the Codex marketplace with
 `codex plugin marketplace add cirwel/unitares-governance-plugin`, install the
 plugin from `/plugins`, and start a new session. Review the bundled lifecycle
 commands in `/hooks`; Codex does not run untrusted plugin hooks automatically.
+The bundled Codex MCP transport is an unauthenticated localhost default. See
+[Configuration](#configuration) before connecting Codex to a hosted or
+authenticated server.
 
 ## Purpose
 
@@ -51,8 +60,8 @@ This repo should not duplicate server business logic or become the source of tru
 
 ## Current Surfaces in This Repo
 
-- Codex/ChatGPT: plugin packaging plus shared skills and explicit command guidance
-- Claude: hooks, session helpers, command docs, and optional file-lease/check-in conveniences
+- Codex/ChatGPT: plugin packaging, synchronous lifecycle hooks, shared skills, and explicit command guidance
+- Claude: asynchronous-capable hooks, session helpers, command docs, and optional check-in conveniences
 - Sidecar: local proxy/facade for clients without native lifecycle hooks, including local and non-frontier model runners
 
 Hermes Agent is intentionally not listed here as the native path. For Hermes, use `unitares-host-adapter` and install a thin Hermes user plugin that imports `unitares_host_adapter.bindings.hermes`. Direct Hermes MCP config only exposes tools; it does not provide automatic lifecycle check-ins by itself.
@@ -90,7 +99,7 @@ That path is now the preferred default. Claude hook automation remains supported
 | [CODEX_START.md](./CODEX_START.md) | Preferred entry path for Codex/ChatGPT — modes, recommended flow, continuity cache |
 | [docs/](./docs/) | Documentation index and design-rationale notes (why the plugin is shaped this way) |
 | [skills/](./skills/) | Agent-facing capability docs — governance fundamentals, lifecycle, dialectic, knowledge graph, Discord bridge |
-| [commands/](./commands/) | Slash-command guidance — `/governance-start`, `/checkin`, `/diagnose`, `/dialectic` |
+| [commands/](./commands/) | Claude Code slash-command guidance — `/governance-start`, `/checkin`, `/diagnose`, `/dialectic` |
 | [CONTRIBUTING.md](./CONTRIBUTING.md) | Branch/PR convention and review standard |
 
 ## Core Workflow
@@ -122,11 +131,14 @@ exploratory leads until you open the details or re-run a better search.
 
 The principle is simple: prefer regular behavioral baselines over raw activity noise. One real check-in per assistant turn is useful; per-tool or per-edit check-ins are usually not.
 
-## Commands
+## Claude Commands
+
+These custom slash commands are packaged for Claude Code. Codex uses the
+skills and explicit MCP tool flow below; it does not install `commands/`.
 
 | Command | Description |
 |---------|-------------|
-| `/governance-start` | Create or declare lineage for a Codex/ChatGPT UNITARES session |
+| `/governance-start` | Create or declare lineage for a Claude Code UNITARES session |
 | `/checkin` | Manual turn-baseline check-in, plus meaningful milestones |
 | `/diagnose` | Show current governance state plus identity/health diagnostics when needed |
 | `/dialectic` | Request a dialectic review |
@@ -144,7 +156,11 @@ The principle is simple: prefer regular behavioral baselines over raw activity n
 ## Prerequisites
 
 1. A running UNITARES governance server
-2. The governance MCP endpoint reachable by the client
+2. Python 3.12+ available to hook shells as `python3`
+3. The governance MCP endpoint reachable by the client
+
+Windows clients additionally need Git Bash from Git for Windows. Marketplace
+installation packages the hook sources but does not install the Python runtime.
 
 This repo is a **client/plugin integration layer only** — it does not include the governance engine. You need a server running before any of these commands or skills do anything useful.
 
@@ -159,32 +175,66 @@ docker compose up
 
 That single command brings up Postgres+AGE+pgvector, Redis, and the governance server. The Pi/Lumen embodiment side is optional — governance runs standalone. For bare-metal install (Homebrew Postgres, native AGE compile) see [unitares/README.md](https://github.com/cirwel/unitares#installation).
 
-Once the server is up, **the plugin registers its MCP client automatically** — it
-ships an `.mcp.json` pointing at `http://localhost:8767/mcp/`, so there is nothing
-to hand-edit. Installing the plugin and starting Claude Code is enough.
+Once the server is up, **the Claude plugin registers its MCP client
+automatically**. It ships an `.mcp.json` pointing at
+`http://localhost:8767/mcp/`, so there is nothing to hand-edit. Installing the
+plugin and starting Claude Code is enough.
 
-If your server is on a different host or port, set `UNITARES_SERVER_URL` to the
-**base** URL (no `/mcp/` suffix — the plugin appends it):
+For Claude Code on a different host or port, set `UNITARES_SERVER_URL` to the
+**base** URL (no `/mcp/` suffix; the plugin appends it):
 
 ```bash
 export UNITARES_SERVER_URL=https://gov.example.org   # plugin uses .../mcp/
+export UNITARES_HTTP_API_TOKEN='replace-with-client-token'
 ```
 
-To override the auto-registered server (e.g. point at a sidecar), a
-manually-configured `unitares-governance` server in your own settings takes
-precedence over the plugin's.
+Claude's bundled transport expands the token into its `Authorization` header.
+Configure that bundled transport through these variables; do not rely on a
+same-named manual Claude server overriding the plugin server.
+
+The bundled Codex `.codex-mcp.json` is deliberately fixed to unauthenticated
+`http://localhost:8767/mcp/` and does not declare a bearer-token environment
+variable. For a hosted or authenticated Codex server, disable that bundled
+transport and register a separate server under the exact
+`unitares-governance` alias:
+
+```toml
+# ~/.codex/config.toml
+[plugins."unitares-governance@unitares-governance".mcp_servers.unitares-governance]
+enabled = false
+```
+
+```bash
+export UNITARES_SERVER_URL=https://gov.example.org
+export UNITARES_HTTP_API_TOKEN='replace-with-client-token'
+codex mcp add unitares-governance \
+  --url "${UNITARES_SERVER_URL%/}/mcp/" \
+  --bearer-token-env-var UNITARES_HTTP_API_TOKEN
+```
+
+Codex hooks trust only the bare `unitares-governance` server alias. Claude's
+plugin-scoped alias is host-specific and is not accepted at the Codex hook
+boundary.
 
 ## Configuration
 
-Environment variables:
+Environment variables. Explicit values take precedence over plugin defaults,
+including `0` and `off` kill switches:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `UNITARES_SERVER_URL` | `http://localhost:8767` | Governance server base URL |
-| `UNITARES_AGENT_PREFIX` | `claude` | Prefix for generated client-side names in Claude hooks |
-| `UNITARES_AUTO_ONBOARD` | `on` | Let Claude `post-stop` lazily create a slot-scoped identity before its first turn summary if the agent did not manually onboard |
-| `UNITARES_FILE_LEASES_ENABLED` | `1` | Enable Claude Edit/Write/MultiEdit file-lease guard |
-| `UNITARES_FILE_LEASES_REQUIRED` | `0` | Block edits when lease infrastructure is missing/unreachable |
+| `UNITARES_HTTP_API_TOKEN` | unset | Client bearer token for governance REST calls, Claude's bundled MCP transport, and a separately registered authenticated Codex transport; hosted deployments must use one token accepted by the server |
+| `UNITARES_AGENT_PREFIX` | host-specific | Prefix for generated client-side names (`claude` or `codex` unless overridden) |
+| `UNITARES_AUTO_ONBOARD` | `on` | Let the host Stop hook create a slot-scoped identity before its first turn summary when needed |
+| `UNITARES_FILE_LEASES_ENABLED` | `1` | Enable host edit leases (Claude Edit/Write/MultiEdit; Codex apply_patch) |
+| `UNITARES_FILE_LEASES_REQUIRED` | `0` | Block edits when lease infrastructure is missing/unreachable; truthy values take precedence over `UNITARES_FILE_LEASES_ENABLED=0` |
+| `UNITARES_FILE_LEASE_TTL_S` | `300` | Crash-recovery backstop for a lease not released by PostToolUse |
+| `UNITARES_FILE_LEASE_BATCH_TIMEOUT_S` | `3.5` | Total bounded lease work per edit hook (clamped to four seconds) |
+| `UNITARES_MILESTONE_LOCK_TIMEOUT_S` | `2.0` | Maximum wait for the cross-process milestone lock (clamped to four seconds) |
+| `UNITARES_SESSION_CACHE_LOCK_TIMEOUT_S` | `2.0` | Maximum wait for a slot-scoped session-cache transaction (clamped to four seconds) |
+| `UNITARES_AUTO_CHECKIN_CLAIM_TTL_S` | `30` | Crash-recovery expiry for Claude's single in-flight edit check-in claim (clamped to 30-120 seconds) |
+| `UNITARES_WATCHER_ENABLED` | `0` | Opt in to the explicitly configured `UNITARES_WATCHER_HOOK`; workspace-local executables are never auto-run |
 | `LEASE_PLANE_BASE_URL` | `http://127.0.0.1:8788` | BEAM lease-plane HTTP base URL |
 | `LEASE_PLANE_BEARER_TOKEN` | unset | Bearer used for lease-plane acquire, heartbeat, and release calls |
 
@@ -193,13 +243,15 @@ Environment variables:
 Adapters are a convenience layer over the governance server, not the canonical
 policy — the server stays the source of truth and the client stays thin.
 
-- **Claude** — session-start, pre-edit, post-edit, and session-end hooks, plus BEAM file leases.
-- **Codex/ChatGPT** — minimal and explicit; shared skills, manual command flows, slot-scoped continuity cache.
+- **Claude** — host-native lifecycle hooks, asynchronous edit check-ins, batch-completion cleanup, and BEAM file leases.
+- **Codex/ChatGPT** — synchronous lifecycle hooks, multi-file apply_patch leases, Stop cleanup, local edit milestones, and slot-scoped continuity cache.
 - **Sidecar** — a dependency-free local proxy/facade for clients without lifecycle hooks; recommended for local/non-frontier model runners that should not manage identity proof material in prompt context.
 - **Hermes Agent** — native lifecycle binding lives in `unitares-host-adapter`; this repo is only relevant to Hermes if you deliberately route through the generic sidecar instead.
 
 Full details, endpoints, and configuration are in [docs/adapters.md](./docs/adapters.md).
 The Codex/ChatGPT quickstart is [CODEX_START.md](./CODEX_START.md).
+Windows hook execution requires Git Bash and Python 3.12+ available as
+`python3`; required lease mode fails closed when the wrapper cannot find Bash.
 
 ## Non-Goals
 
@@ -212,8 +264,8 @@ This repo should not:
 
 ## Check-In Triggers
 
-The Claude adapter emits canonical `process_agent_update` calls at three trigger
-points (`turn_stop`, `auto_edit`, `session_end`) through one shared helper
+The Claude adapter emits canonical `process_agent_update` calls at two trigger
+points (`turn_stop` and `auto_edit`) through one shared helper
 (`scripts/checkin.py`) that redacts secrets, truncates, logs, and is
 fire-and-forget. A `UNITARES_CHECKINS=off` kill switch suppresses all of them.
 

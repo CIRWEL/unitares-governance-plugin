@@ -8,25 +8,80 @@ for session identity — Part C of the identity honesty series.
 
 from __future__ import annotations
 
-import json
 import hashlib
+import itertools
+import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 
 PLUGIN_ROOT = Path(__file__).parent.parent
 HOOK = PLUGIN_ROOT / "hooks" / "post-identity"
+PRE_HOOK = PLUGIN_ROOT / "hooks" / "pre-governance-call"
+SESSION_CACHE = PLUGIN_ROOT / "scripts" / "session_cache.py"
+_EVENT_IDS = itertools.count()
 
 
-def _run_hook(hook_input: dict, workspace: Path):
+def _hook_env(workspace: Path, home: Path | None = None) -> dict[str, str]:
+    return {**os.environ, "HOME": str(home or workspace / "home")}
+
+
+def _run_pre_hook(
+    hook_input: dict,
+    workspace: Path,
+    *,
+    host: str | None = None,
+    home: Path | None = None,
+):
+    command = [str(PRE_HOOK)]
+    if host:
+        command.extend(["--host", host])
     return subprocess.run(
-        [str(HOOK)],
+        command,
         input=json.dumps(hook_input),
         text=True,
         capture_output=True,
         timeout=10,
         cwd=str(workspace),
+        env=_hook_env(workspace, home),
     )
+
+
+def _run_post_hook(
+    hook_input: dict,
+    workspace: Path,
+    *,
+    host: str | None = None,
+    home: Path | None = None,
+):
+    command = [str(HOOK)]
+    if host:
+        command.extend(["--host", host])
+    return subprocess.run(
+        command,
+        input=json.dumps(hook_input),
+        text=True,
+        capture_output=True,
+        timeout=10,
+        cwd=str(workspace),
+        env=_hook_env(workspace, home),
+    )
+
+
+def _run_hook(
+    hook_input: dict,
+    workspace: Path,
+    *,
+    host: str | None = None,
+    home: Path | None = None,
+):
+    payload = json.loads(json.dumps(hook_input))
+    if not payload.get("tool_use_id") and not payload.get("tool_call_id"):
+        payload["tool_use_id"] = f"identity-test-{next(_EVENT_IDS)}"
+    _run_pre_hook(payload, workspace, host=host, home=home)
+    return _run_post_hook(payload, workspace, host=host, home=home)
 
 
 def _read_session_cache(workspace: Path, slot: str | None = None) -> dict:
@@ -76,6 +131,30 @@ def _mcp_response_list(uuid="u-123", agent_id="Test_Agent", sid="agent-abc",
     return [{"type": "text", "text": json.dumps(inner)}]
 
 
+def _start_session_response(uuid="u-123", agent_id="Test_Agent", sid="agent-abc",
+                            token="v1.tok", display_name="TestAgent"):
+    """Build the friendly start_session envelope returned by current servers."""
+    inner = {
+        "success": True,
+        "tool": "start_session",
+        "agent_uuid": uuid,
+        "client_session_id": sid,
+        "next_action": "Save agent_uuid and client_session_id, then check in.",
+        "state_summary": {"lineage_state": "fresh"},
+        "raw_governance": {
+            "success": True,
+            "uuid": uuid,
+            "agent_id": agent_id,
+            "client_session_id": sid,
+            "continuity_token": token,
+            "display_name": display_name,
+            "continuity_token_supported": True,
+            "session_resolution_source": "force_new",
+        },
+    }
+    return {"content": [{"type": "text", "text": json.dumps(inner)}]}
+
+
 class TestPostIdentityRecordsResponse:
     def test_onboard_response_writes_slotted_cache(self, tmp_path):
         slot = "session-xyz-1234"
@@ -121,18 +200,40 @@ class TestPostIdentityRecordsResponse:
         assert result.returncode == 0
         assert _read_session_cache(tmp_path, "slot-bind")["uuid"] == "u-bind-1"
 
-    def test_start_session_alias_writes_slotted_cache(self, tmp_path):
+    def test_claude_start_session_envelope_writes_slotted_cache(self, tmp_path):
         # start_session is the friendly-workflow alias for onboard; without
         # this, alias-onboarded sessions never write the cache and run dark.
         hook_input = {
-            "session_id": "slot-alias",
+            "session_id": "slot-claude-alias",
+            "tool_name": "mcp__plugin_unitares-governance_unitares-governance__start_session",
+            "tool_input": {"force_new": True},
+            "tool_response": _start_session_response(uuid="u-claude-alias"),
+        }
+        result = _run_hook(hook_input, tmp_path, host="claude")
+        assert result.returncode == 0
+        cache = _read_session_cache(tmp_path, "slot-claude-alias")
+        assert cache["uuid"] == "u-claude-alias"
+        assert cache["agent_id"] == "Test_Agent"
+        assert cache["client_session_id"] == "agent-abc"
+        assert cache["display_name"] == "TestAgent"
+        assert cache["continuity_token_supported"] is True
+        assert cache["session_resolution_source"] == "force_new"
+
+    def test_codex_start_session_envelope_writes_slotted_cache(self, tmp_path):
+        hook_input = {
+            "session_id": "slot-codex-alias",
             "tool_name": "mcp__unitares-governance__start_session",
             "tool_input": {"force_new": True},
-            "tool_response": _mcp_response(uuid="u-alias-1"),
+            "tool_response": _start_session_response(uuid="u-codex-alias"),
         }
-        result = _run_hook(hook_input, tmp_path)
+        result = _run_hook(hook_input, tmp_path, host="codex")
         assert result.returncode == 0
-        assert _read_session_cache(tmp_path, "slot-alias")["uuid"] == "u-alias-1"
+
+        cache = _read_session_cache(tmp_path, "slot-codex-alias")
+        assert cache["uuid"] == "u-codex-alias"
+        assert cache["agent_id"] == "Test_Agent"
+        assert cache["client_session_id"] == "agent-abc"
+        assert cache["display_name"] == "TestAgent"
 
     def test_codex_transcript_path_writes_hashed_slot_cache(self, tmp_path):
         transcript = "/home/user/.codex/sessions/2026/06/18/rollout.jsonl"
@@ -150,6 +251,266 @@ class TestPostIdentityRecordsResponse:
         cache = _read_session_cache(tmp_path, slot)
         assert cache["uuid"] == "u-codex-1"
         assert cache["client_session_id"] == "agent-abc"
+
+    def test_raw_session_id_uses_same_sanitized_slot_in_pre_and_post(self, tmp_path):
+        hook_input = {
+            "session_id": "slot/with:chars",
+            "tool_name": "mcp__unitares-governance__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": _mcp_response(uuid="u-sanitized"),
+        }
+
+        assert _run_hook(hook_input, tmp_path).returncode == 0
+        assert _read_session_cache(tmp_path, "slot_with_chars")["uuid"] == "u-sanitized"
+
+
+class TestPostIdentityGenerationGuard:
+    def test_older_async_response_cannot_overwrite_newer_identity(self, tmp_path):
+        slot = "identity-ordering"
+        older = {
+            "session_id": slot,
+            "tool_use_id": "toolu_identity_older",
+            "tool_name": "mcp__unitares-governance__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": _mcp_response(uuid="u-older", sid="agent-older"),
+        }
+        newer = {
+            "session_id": slot,
+            "tool_use_id": "toolu_identity_newer",
+            "tool_name": "mcp__unitares-governance__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": _mcp_response(uuid="u-newer", sid="agent-newer"),
+        }
+
+        assert _run_pre_hook(older, tmp_path).returncode == 0
+        assert _run_pre_hook(newer, tmp_path).returncode == 0
+        assert _run_post_hook(newer, tmp_path).returncode == 0
+        assert _run_post_hook(older, tmp_path).returncode == 0
+
+        cache = _read_session_cache(tmp_path, slot)
+        assert cache["uuid"] == "u-newer"
+        assert cache["client_session_id"] == "agent-newer"
+        assert list((tmp_path / ".unitares" / "session-snapshots").glob("*.json")) == []
+
+    def test_later_invocation_wins_even_when_older_response_finishes_first(
+        self,
+        tmp_path,
+    ):
+        slot = "identity-invocation-order"
+        older = {
+            "session_id": slot,
+            "tool_use_id": "toolu_invocation_older",
+            "tool_name": "mcp__unitares-governance__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": _mcp_response(uuid="u-first", sid="agent-first"),
+        }
+        newer = {
+            "session_id": slot,
+            "tool_use_id": "toolu_invocation_newer",
+            "tool_name": "mcp__unitares-governance__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": _mcp_response(uuid="u-second", sid="agent-second"),
+        }
+
+        assert _run_pre_hook(older, tmp_path).returncode == 0
+        assert _run_pre_hook(newer, tmp_path).returncode == 0
+        assert _run_post_hook(older, tmp_path).returncode == 0
+        assert _run_post_hook(newer, tmp_path).returncode == 0
+
+        cache = _read_session_cache(tmp_path, slot)
+        assert cache["uuid"] == "u-second"
+        assert cache["client_session_id"] == "agent-second"
+
+    def test_shared_home_rejects_stale_response_from_another_workspace(self, tmp_path):
+        workspace_a = tmp_path / "workspace-a"
+        workspace_b = tmp_path / "workspace-b"
+        shared_home = tmp_path / "shared-home"
+        workspace_a.mkdir()
+        workspace_b.mkdir()
+        shared_home.mkdir()
+        slot = "shared-home-order"
+        older = {
+            "session_id": slot,
+            "tool_use_id": "toolu_shared_older",
+            "tool_name": "mcp__unitares-governance__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": _mcp_response(uuid="u-shared-old", sid="agent-old"),
+        }
+        newer = {
+            "session_id": slot,
+            "tool_use_id": "toolu_shared_newer",
+            "tool_name": "mcp__unitares-governance__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": _mcp_response(uuid="u-shared-new", sid="agent-new"),
+        }
+
+        assert _run_pre_hook(older, workspace_a, home=shared_home).returncode == 0
+        assert _run_pre_hook(newer, workspace_b, home=shared_home).returncode == 0
+        assert _run_post_hook(newer, workspace_b, home=shared_home).returncode == 0
+        assert _run_post_hook(older, workspace_a, home=shared_home).returncode == 0
+
+        assert _read_session_cache(shared_home, slot)["uuid"] == "u-shared-new"
+        assert _read_session_cache(workspace_b, slot)["uuid"] == "u-shared-new"
+        assert _read_session_cache(workspace_a, slot) == {}
+
+    def test_cross_workspace_clear_prevents_home_resurrection(self, tmp_path):
+        workspace_a = tmp_path / "workspace-a"
+        workspace_b = tmp_path / "workspace-b"
+        shared_home = tmp_path / "shared-home"
+        workspace_a.mkdir()
+        workspace_b.mkdir()
+        shared_home.mkdir()
+        slot = "shared-home-clear"
+        seed = {
+            "session_id": slot,
+            "tool_use_id": "toolu_shared_seed",
+            "tool_name": "mcp__unitares-governance__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": _mcp_response(uuid="u-seed"),
+        }
+        delayed = {
+            "session_id": slot,
+            "tool_use_id": "toolu_shared_delayed",
+            "tool_name": "mcp__unitares-governance__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": _mcp_response(uuid="u-delayed"),
+        }
+        assert _run_hook(seed, workspace_b, home=shared_home).returncode == 0
+        assert _run_pre_hook(delayed, workspace_a, home=shared_home).returncode == 0
+
+        cleared = subprocess.run(
+            [
+                sys.executable,
+                str(SESSION_CACHE),
+                "clear",
+                "session",
+                "--workspace",
+                str(workspace_b),
+                "--slot",
+                slot,
+            ],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            env=_hook_env(workspace_b, shared_home),
+        )
+        assert cleared.returncode == 0, cleared.stderr
+        assert _run_post_hook(delayed, workspace_a, home=shared_home).returncode == 0
+        assert _read_session_cache(shared_home, slot) == {}
+        assert _read_session_cache(workspace_a, slot) == {}
+
+    def test_home_recovery_does_not_let_old_response_overwrite_new_identity(
+        self,
+        tmp_path,
+    ):
+        workspace_a = tmp_path / "workspace-a"
+        workspace_b = tmp_path / "workspace-b"
+        shared_home = tmp_path / "shared-home"
+        workspace_a.mkdir()
+        workspace_b.mkdir()
+        shared_home.mkdir()
+        blocked_mirror = shared_home / ".unitares"
+        blocked_mirror.write_text("not a directory", encoding="utf-8")
+        slot = "home-recovery-order"
+        older = {
+            "session_id": slot,
+            "tool_use_id": "toolu_recovery_older",
+            "tool_name": "mcp__unitares-governance__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": _mcp_response(uuid="u-recovery-old"),
+        }
+        newer = {
+            "session_id": slot,
+            "tool_use_id": "toolu_recovery_newer",
+            "tool_name": "mcp__unitares-governance__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": _mcp_response(uuid="u-recovery-new"),
+        }
+
+        assert _run_pre_hook(older, workspace_a, home=shared_home).returncode == 0
+        blocked_mirror.unlink()
+        blocked_mirror.mkdir()
+        assert _run_pre_hook(newer, workspace_b, home=shared_home).returncode == 0
+        assert _run_post_hook(newer, workspace_b, home=shared_home).returncode == 0
+        assert _run_post_hook(older, workspace_a, home=shared_home).returncode == 0
+
+        assert _read_session_cache(shared_home, slot)["uuid"] == "u-recovery-new"
+        assert _read_session_cache(workspace_b, slot)["uuid"] == "u-recovery-new"
+        assert _read_session_cache(workspace_a, slot) == {}
+
+    def test_clear_supersedes_inflight_identity_response(self, tmp_path):
+        slot = "identity-clear-race"
+        event = {
+            "session_id": slot,
+            "tool_use_id": "toolu_identity_cleared",
+            "tool_name": "mcp__unitares-governance__start_session",
+            "tool_input": {"force_new": True},
+            "tool_response": _start_session_response(uuid="u-cleared"),
+        }
+
+        assert _run_pre_hook(event, tmp_path).returncode == 0
+        cleared = subprocess.run(
+            [
+                sys.executable,
+                str(SESSION_CACHE),
+                "clear",
+                "session",
+                "--workspace",
+                str(tmp_path),
+                "--slot",
+                slot,
+            ],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            env=_hook_env(tmp_path),
+        )
+        assert cleared.returncode == 0, cleared.stderr
+        assert _run_post_hook(event, tmp_path).returncode == 0
+        assert _read_session_cache(tmp_path, slot) == {}
+
+    def test_post_without_pretool_snapshot_does_not_write(self, tmp_path):
+        event = {
+            "session_id": "identity-no-pre",
+            "tool_use_id": "toolu_identity_no_pre",
+            "tool_name": "mcp__unitares-governance__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": _mcp_response(uuid="u-no-pre"),
+        }
+
+        assert _run_post_hook(event, tmp_path).returncode == 0
+        assert _read_session_cache(tmp_path, "identity-no-pre") == {}
+
+    def test_post_without_tool_id_does_not_write(self, tmp_path):
+        event = {
+            "session_id": "identity-no-id",
+            "tool_name": "mcp__unitares-governance__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": _mcp_response(uuid="u-no-id"),
+        }
+
+        assert _run_post_hook(event, tmp_path).returncode == 0
+        assert _read_session_cache(tmp_path, "identity-no-id") == {}
+
+    def test_failed_response_discards_generation_snapshot(self, tmp_path):
+        event = {
+            "session_id": "identity-failed",
+            "tool_use_id": "toolu_identity_failed",
+            "tool_name": "mcp__unitares-governance__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({"success": False, "error": "rejected"}),
+                    }
+                ]
+            },
+        }
+
+        assert _run_pre_hook(event, tmp_path).returncode == 0
+        assert _run_post_hook(event, tmp_path).returncode == 0
+        assert list((tmp_path / ".unitares" / "session-snapshots").glob("*.json")) == []
 
 
 class TestSubagentOnboardGuard:
@@ -297,6 +658,28 @@ class TestSubagentOnboardGuard:
 
 
 class TestPostIdentityIgnoresOtherTools:
+    def test_foreign_onboard_response_cannot_poison_slot_cache(self, tmp_path):
+        slot = "foreign-server-slot"
+        legitimate = {
+            "session_id": slot,
+            "tool_name": "mcp__unitares-governance__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": _mcp_response(uuid="u-driver", sid="agent-driver"),
+        }
+        assert _run_hook(legitimate, tmp_path).returncode == 0
+
+        foreign = {
+            "session_id": slot,
+            "tool_name": "mcp__evil-unitares-proxy__onboard",
+            "tool_input": {"force_new": True},
+            "tool_response": _mcp_response(uuid="u-foreign", sid="agent-foreign"),
+        }
+        assert _run_hook(foreign, tmp_path).returncode == 0
+
+        cache = _read_session_cache(tmp_path, slot)
+        assert cache["uuid"] == "u-driver"
+        assert cache["client_session_id"] == "agent-driver"
+
     def test_ignores_process_agent_update(self, tmp_path):
         """process_agent_update has its own hook — post-identity must skip."""
         hook_input = {

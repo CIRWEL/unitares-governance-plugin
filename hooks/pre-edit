@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
-# UNITARES Governance Plugin — PreToolUse hook (Edit/Write/MultiEdit)
+# UNITARES Governance Plugin — host-specific PreToolUse edit hook
 #
-# Acquires a BEAM file lease before Claude mutates a file. Missing lease-plane
+# Acquires BEAM file leases before a host mutates files. Missing lease-plane
 # configuration fails open by default so the plugin remains usable offline;
 # real contention (`held_by_other`) exits 2 and blocks the tool.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+HOOK_HOST="claude"
+if [[ "${1:-}" == "--host" && -n "${2:-}" ]]; then
+  HOOK_HOST="$2"
+fi
+if [[ "${HOOK_HOST}" != "claude" && "${HOOK_HOST}" != "codex" ]]; then
+  exit 0
+fi
 
 DEFAULTS_FILE=""
 for candidate in \
@@ -29,6 +37,23 @@ if [[ -n "${SERVER_URL_OVERRIDE}" ]]; then
   UNITARES_SERVER_URL="${SERVER_URL_OVERRIDE}"
 fi
 
+_leases_required() {
+  case "$(printf '%s' "${UNITARES_FILE_LEASES_REQUIRED:-0}" \
+      | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    1|true|on|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_missing_runtime() {
+  local reason="$1"
+  if _leases_required; then
+    printf 'BLOCKED: file lease required but unavailable: %s\n' "${reason}" >&2
+    exit 2
+  fi
+  exit 0
+}
+
 HOOK_INPUT=""
 if [[ ! -t 0 ]]; then
   HOOK_INPUT=$(cat 2>/dev/null) || true
@@ -36,7 +61,20 @@ fi
 
 HELPER="${PLUGIN_ROOT}/scripts/file_lease_hook.py"
 if [[ ! -f "${HELPER}" ]]; then
-  exit 0
+  _missing_runtime "file_lease_hook.py is missing"
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  _missing_runtime "python3 is missing"
 fi
 
-printf '%s' "${HOOK_INPUT}" | python3 "${HELPER}" pre-edit --workspace "${PWD}"
+printf '%s' "${HOOK_INPUT}" | python3 "${HELPER}" pre-edit \
+  --workspace "${PWD}" --host "${HOOK_HOST}"
+HELPER_STATUS=$?
+if [[ "${HELPER_STATUS}" -ne 0 ]] && _leases_required; then
+  if [[ "${HELPER_STATUS}" -ne 2 ]]; then
+    printf 'BLOCKED: required file lease helper exited with status %s\n' \
+      "${HELPER_STATUS}" >&2
+  fi
+  exit 2
+fi
+exit "${HELPER_STATUS}"

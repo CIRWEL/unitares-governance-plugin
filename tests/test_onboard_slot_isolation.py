@@ -13,10 +13,12 @@ end-to-end promise that different slots yield different UUIDs.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import stat
 import sys
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -109,7 +111,7 @@ def test_transport_error_returns_structured_failure(monkeypatch: Any) -> None:
     def deny_network(*args: Any, **kwargs: Any) -> Any:
         raise urllib.error.URLError(PermissionError(1, "Operation not permitted"))
 
-    monkeypatch.setattr(urllib.request, "urlopen", deny_network)
+    monkeypatch.setattr("onboard_helper.authorization_safe_urlopen", deny_network)
 
     result = _post_json(
         "http://unit-test/v1/tools/call",
@@ -175,6 +177,7 @@ def test_cache_file_is_mode_0600_and_omits_continuity_token(tmp_path: Path) -> N
     assert result["status"] == "ok"
     cache_file = tmp_path / ".unitares" / "session.json"
     assert cache_file.exists()
+    assert cache_file.with_suffix(".lock").exists()
     mode = stat.S_IMODE(os.stat(cache_file).st_mode)
     assert mode == 0o600, f"expected mode 0600, got {oct(mode)}"
 
@@ -189,14 +192,13 @@ def test_cache_file_is_mode_0600_and_omits_continuity_token(tmp_path: Path) -> N
 def test_write_failure_does_not_leave_tmp_file(tmp_path: Path, monkeypatch: Any) -> None:
     """S20.3: a failed atomic write unlinks the temp file rather than
     leaving a .tmp turd in ``.unitares/``."""
+    import _session_cache_io
     import onboard_helper
-
-    real_replace = os.replace
 
     def boom(*args, **kwargs):
         raise OSError("simulated replace failure")
 
-    monkeypatch.setattr(onboard_helper.os, "replace", boom)
+    monkeypatch.setattr(_session_cache_io.os, "replace", boom)
     with pytest.raises(OSError):
         onboard_helper._write_cache(tmp_path, {"uuid": "x"}, slot=None)
 
@@ -204,7 +206,142 @@ def test_write_failure_does_not_leave_tmp_file(tmp_path: Path, monkeypatch: Any)
     if cache_dir.exists():
         stragglers = [p for p in cache_dir.iterdir() if p.suffix == ".tmp"]
         assert stragglers == [], f"temp file leaked: {stragglers}"
-    monkeypatch.setattr(onboard_helper.os, "replace", real_replace)
+
+
+def test_onboard_writer_mirrors_slot_and_removes_stale_mirror_on_failure(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    import _session_cache_io
+    import onboard_helper
+
+    workspace = tmp_path / "workspace"
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    slot = "mirrored-onboard"
+    old = {"uuid": "old", "client_session_id": "agent-old"}
+    new = {"uuid": "new", "client_session_id": "agent-new"}
+    onboard_helper._write_cache(workspace, old, slot)
+    home_path = fake_home / ".unitares" / f"session-{slot}.json"
+    assert json.loads(home_path.read_text(encoding="utf-8")) == old
+
+    real_write = _session_cache_io.write_json_dict_unlocked
+
+    def fail_home(path: Path, payload: dict[str, Any]) -> None:
+        if path == home_path:
+            raise OSError("simulated mirror failure")
+        real_write(path, payload)
+
+    monkeypatch.setattr(_session_cache_io, "write_json_dict_unlocked", fail_home)
+    onboard_helper._write_cache(workspace, new, slot)
+
+    workspace_path = workspace / ".unitares" / f"session-{slot}.json"
+    assert json.loads(workspace_path.read_text(encoding="utf-8")) == new
+    assert not home_path.exists()
+
+
+def test_clear_from_empty_supersedes_inflight_lazy_onboard(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    import onboard_helper
+    import session_cache
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    called = threading.Event()
+    release = threading.Event()
+    result: dict[str, Any] = {}
+    slot = "clear-empty-race"
+
+    def blocked_transport(*_args: Any) -> dict:
+        called.set()
+        assert release.wait(timeout=5)
+        return _onboard_ok_response(
+            "aaaaaaaa-0000-4000-8000-000000000099",
+            "late",
+        )
+
+    def lazy_onboard() -> None:
+        result.update(
+            run_onboard(
+                server_url="http://unit-test",
+                agent_name="late",
+                model_type="claude-code",
+                workspace=tmp_path,
+                slot=slot,
+                post_json=blocked_transport,
+            )
+        )
+
+    worker = threading.Thread(target=lazy_onboard)
+    worker.start()
+    assert called.wait(timeout=5)
+    assert session_cache.cmd_clear(
+        argparse.Namespace(kind="session", workspace=str(tmp_path), slot=slot)
+    ) == 0
+    release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert result["status"] == "onboard_superseded"
+    assert onboard_helper._read_cache(tmp_path, slot) == {}
+    assert not (fake_home / ".unitares" / f"session-{slot}.json").exists()
+    generation = tmp_path / ".unitares" / f"session-{slot}.generation"
+    assert int(generation.read_text(encoding="ascii")) >= 1
+
+
+def test_inflight_lazy_onboard_preserves_newer_explicit_identity(tmp_path: Path) -> None:
+    """An async lazy onboard must not overwrite an identity hook's later choice."""
+    import onboard_helper
+
+    called = threading.Event()
+    release = threading.Event()
+    result: dict[str, Any] = {}
+    slot = "race-slot"
+
+    def blocked_transport(*_args: Any) -> dict:
+        called.set()
+        assert release.wait(timeout=5)
+        return _onboard_ok_response(
+            "aaaaaaaa-0000-4000-8000-000000000001",
+            "lazy",
+        )
+
+    def lazy_onboard() -> None:
+        result.update(
+            run_onboard(
+                server_url="http://unit-test",
+                agent_name="lazy",
+                model_type="claude-code",
+                workspace=tmp_path,
+                slot=slot,
+                post_json=blocked_transport,
+            )
+        )
+
+    worker = threading.Thread(target=lazy_onboard)
+    worker.start()
+    assert called.wait(timeout=5)
+    explicit = {
+        "uuid": "bbbbbbbb-0000-4000-8000-000000000002",
+        "agent_id": "explicit-agent",
+        "client_session_id": "agent-explicit",
+        "display_name": "explicit",
+    }
+    onboard_helper._write_cache(tmp_path, explicit, slot)
+    release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    cached = onboard_helper._read_cache(tmp_path, slot)
+    assert cached == explicit
+    assert result["status"] == "ok"
+    assert result["uuid"] == explicit["uuid"]
+    assert result["client_session_id"] == explicit["client_session_id"]
+    assert result["continuity_token"] == ""
 
 
 def test_slotted_onboard_sends_scoped_name(tmp_path: Path) -> None:

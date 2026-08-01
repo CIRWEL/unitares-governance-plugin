@@ -1,16 +1,57 @@
 #!/usr/bin/env bash
 # UNITARES Governance Plugin — Stop hook
 #
-# Fires once per Claude turn (when Claude stops emitting actions).
+# Fires once per host turn (when the client stops emitting actions).
 # Reads the Stop hook JSON payload on stdin, builds a turn summary,
 # submits a process_agent_update via scripts/checkin.py, exits fast.
 #
-# Invocation is synchronous (5s POST timeout in checkin.py); `|| true`
-# at the end prevents the hook from blocking the turn on failure.
+# Claude invokes this asynchronously. Codex invokes it synchronously with
+# bounded onboard and check-in budgets below the manifest's outer timeout.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+HOOK_HOST="claude"
+if [[ "${1:-}" == "--host" && -n "${2:-}" ]]; then
+  HOOK_HOST="$2"
+fi
+if [[ "${HOOK_HOST}" != "claude" && "${HOOK_HOST}" != "codex" ]]; then
+  exit 0
+fi
+# Codex treats empty or plain-text stdout from a successful Stop hook as an
+# invalid response. Emit one neutral JSON object on every Codex exit path;
+# Claude's asynchronous Stop hook remains silent.
+_emit_codex_stop_output() {
+  [[ "${HOOK_HOST}" == "codex" ]] && printf '{}\n'
+}
+trap _emit_codex_stop_output EXIT
+
+HOST_MODEL_TYPE="codex"
+[[ "${HOOK_HOST}" == "claude" ]] && HOST_MODEL_TYPE="claude-code"
+
+# Codex Stop has a 30-second outer timeout. Keep network work at or below
+# 20 seconds so payload normalization, cache I/O, and process startup retain
+# a meaningful margin. Operator overrides may lower these caps, never raise
+# them for Codex. Claude's asynchronous hook keeps the configured defaults.
+CODEX_ONBOARD_TIMEOUT_CAP="5"
+CODEX_CHECKIN_TIMEOUT_CAP="15"
+
+_timeout_at_most() {
+  python3 - "$1" "$2" <<'PY' 2>/dev/null || printf '%s\n' "$2"
+import math
+import sys
+
+cap = float(sys.argv[2])
+try:
+    value = float(sys.argv[1])
+except (TypeError, ValueError):
+    value = cap
+if not math.isfinite(value) or value <= 0:
+    value = cap
+print(f"{min(value, cap):g}")
+PY
+}
 
 DEFAULTS_FILE=""
 for candidate in \
@@ -56,19 +97,50 @@ if [[ -n "${AGENT_NAME_OVERRIDE}" ]]; then
 fi
 if [[ -n "${AGENT_PREFIX_OVERRIDE}" ]]; then
   UNITARES_AGENT_PREFIX="${AGENT_PREFIX_OVERRIDE}"
+elif [[ "${HOOK_HOST}" == "codex" ]]; then
+  UNITARES_AGENT_PREFIX="codex"
 fi
 if [[ -n "${MODEL_TYPE_OVERRIDE}" ]]; then
   UNITARES_MODEL_TYPE="${MODEL_TYPE_OVERRIDE}"
+elif [[ "${HOOK_HOST}" == "codex" ]]; then
+  UNITARES_MODEL_TYPE="codex"
 fi
 if [[ -n "${AUTO_ONBOARD_TIMEOUT_OVERRIDE}" ]]; then
   UNITARES_AUTO_ONBOARD_TIMEOUT="${AUTO_ONBOARD_TIMEOUT_OVERRIDE}"
 fi
 SERVER_URL="${UNITARES_SERVER_URL:-http://localhost:8767}"
+ONBOARD_TIMEOUT="${UNITARES_AUTO_ONBOARD_TIMEOUT:-10}"
+CHECKIN_TIMEOUT="${UNITARES_CHECKIN_TIMEOUT:-20}"
+if [[ "${HOOK_HOST}" == "codex" ]]; then
+  ONBOARD_TIMEOUT="$(_timeout_at_most "${ONBOARD_TIMEOUT}" "${CODEX_ONBOARD_TIMEOUT_CAP}")"
+  CHECKIN_TIMEOUT="$(_timeout_at_most "${CHECKIN_TIMEOUT}" "${CODEX_CHECKIN_TIMEOUT_CAP}")"
+fi
 
-# Read stdin once — we use it both for the turn summary AND for the
-# session-cache lookup (Claude Code's session_id field is the slot).
+# Read stdin once for host normalization and session-cache lookup.
 PAYLOAD=$(cat 2>/dev/null || echo "{}")
 [[ -z "${PAYLOAD}" ]] && PAYLOAD="{}"
+
+STOP_EVENT_HELPER="${PLUGIN_ROOT}/scripts/stop_hook_event.py"
+if [[ ! -f "${STOP_EVENT_HELPER}" ]]; then
+  exit 0
+fi
+if ! STOP_EVENT=$(printf '%s' "${PAYLOAD}" | python3 "${STOP_EVENT_HELPER}" \
+  --host "${HOOK_HOST}" 2>/dev/null); then
+  exit 0
+fi
+
+_stop_field() {
+  python3 - "$1" "${STOP_EVENT}" <<'PY' 2>/dev/null || true
+import json, sys
+field = sys.argv[1]
+try:
+    payload = json.loads(sys.argv[2])
+except Exception:
+    payload = {}
+value = payload.get(field, "")
+print(value if value is not None else "")
+PY
+}
 
 # Resolve slot-aware session cache via shared helper.
 SESSION_LOOKUP="${PLUGIN_ROOT}/scripts/_session_lookup.py"
@@ -77,9 +149,26 @@ if [[ ! -f "${SESSION_LOOKUP}" ]]; then
 fi
 eval "$(printf '%s' "${PAYLOAD}" | python3 "${SESSION_LOOKUP}" --workspace "${PWD}")"
 
+# Codex has no failed-tool post hook. Reclaim only this session's unused
+# PreToolUse check-in snapshots at the synchronous turn boundary; snapshots
+# from other concurrent sessions in the workspace remain untouched.
+SNAPSHOT_SLOT=""
+SLOT_HELPER="${PLUGIN_ROOT}/scripts/_slot_from_stdin.py"
+if [[ "${HOOK_HOST}" == "codex" && -f "${SLOT_HELPER}" ]]; then
+  SNAPSHOT_SLOT=$(printf '%s' "${PAYLOAD}" | python3 "${SLOT_HELPER}" 2>/dev/null || true)
+fi
+if [[ "${HOOK_HOST}" == "codex" && -n "${SNAPSHOT_SLOT}" ]]; then
+  SESSION_CACHE_HELPER="${PLUGIN_ROOT}/scripts/session_cache.py"
+  if [[ -f "${SESSION_CACHE_HELPER}" ]]; then
+    python3 "${SESSION_CACHE_HELPER}" discard-milestone-snapshots \
+      --workspace "${PWD}" \
+      --slot "${SNAPSHOT_SLOT}" >/dev/null 2>&1 || true
+  fi
+fi
+
 # If the agent did not explicitly onboard before the turn ended, provision a
 # slot-scoped identity now so the turn can still produce a real check-in.
-# This is harness-managed attribution for the Claude process, not an
+# This is harness-managed attribution for the host process, not an
 # agent-authored claim. onboard_helper.py owns the safety constraints:
 # force_new=true, per-slot name scoping, lineage via parent_agent_id, no
 # persisted continuity token.
@@ -98,8 +187,8 @@ if [[ -z "${CSID:-}" && -n "${RAW_SLOT:-}" \
   ONBOARD_HELPER="${PLUGIN_ROOT}/scripts/onboard_helper.py"
   if [[ -f "${ONBOARD_HELPER}" ]]; then
     WORKSPACE_NAME="$(basename "${PWD}")"
-    AGENT_NAME="${UNITARES_AGENT_NAME:-${UNITARES_AGENT_PREFIX:-claude}-${WORKSPACE_NAME}}"
-    MODEL_TYPE="${UNITARES_MODEL_TYPE:-claude-code}"
+    AGENT_NAME="${UNITARES_AGENT_NAME:-${UNITARES_AGENT_PREFIX:-${HOOK_HOST}}-${WORKSPACE_NAME}}"
+    MODEL_TYPE="${UNITARES_MODEL_TYPE:-${HOST_MODEL_TYPE}}"
     # Resume anchor (UNITARES_CLIENT_SESSION_ID, e.g. "agent:/thread-<id>") is
     # honored only when the spawner also declares UNITARES_ORCHESTRATED=1. That
     # fail-closed marker lets headless orchestrated turn-children resume one
@@ -112,7 +201,7 @@ if [[ -z "${CSID:-}" && -n "${RAW_SLOT:-}" \
       --workspace "${PWD}" \
       --slot "${RAW_SLOT}" \
       --client-session-id "${UNITARES_CLIENT_SESSION_ID:-}" \
-      --timeout "${UNITARES_AUTO_ONBOARD_TIMEOUT:-10}" \
+      --timeout "${ONBOARD_TIMEOUT}" \
       >/dev/null 2>&1 || true
     eval "$(printf '%s' "${PAYLOAD}" | python3 "${SESSION_LOOKUP}" --workspace "${PWD}")"
   fi
@@ -122,30 +211,12 @@ fi
 # one identity-free substrate FLOOR observation: a measurement that this
 # session ran, NOT an identity claim. It writes to core.substrate_observations
 # via a separate endpoint that never touches the identity path. RAW_SLOT is
-# the raw Claude session_id from stdin, present even when no onboard cache
+# the raw host session_id from stdin, present even when no onboard cache
 # exists.
 if [[ -z "${CSID:-}" ]]; then
   if [[ -n "${RAW_SLOT:-}" ]]; then
-    FLOOR_TOOLS=$(python3 - "${PAYLOAD}" <<'PY'
-import json, sys
-try:
-    p = json.loads(sys.argv[1] if len(sys.argv) > 1 else "{}")
-except Exception:
-    p = {}
-print(len(p.get("tool_calls", []) or []))
-PY
-)
-    FLOOR_SUMMARY=$(python3 - "${PAYLOAD}" <<'PY'
-import json, sys
-try:
-    p = json.loads(sys.argv[1] if len(sys.argv) > 1 else "{}")
-except Exception:
-    p = {}
-n = len(p.get("tool_calls", []) or [])
-text = (p.get("final_text") or "").strip().replace("\n", " ")
-print(f"Floor (un-onboarded): {n} tool calls; {text[:100]}")
-PY
-)
+    FLOOR_TOOLS=$(_stop_field floor_tool_count)
+    FLOOR_SUMMARY=$(_stop_field floor_summary)
     python3 "${PLUGIN_ROOT}/scripts/substrate_floor.py" \
       --slot "${RAW_SLOT}" \
       --event turn_stop \
@@ -156,35 +227,8 @@ PY
   exit 0
 fi
 
-# Build a turn summary (tool count + top-3 tool names + truncated final text).
-SUMMARY=$(python3 - "${PAYLOAD}" <<'PY'
-import json, sys
-raw = sys.argv[1] if len(sys.argv) > 1 else "{}"
-try:
-    p = json.loads(raw)
-except Exception:
-    p = {}
-tools = p.get("tool_calls", []) or []
-names = [t.get("name") for t in tools if isinstance(t, dict) and t.get("name")]
-top3 = ", ".join(names[:3]) if names else "no tools"
-text = (p.get("final_text") or "").strip().replace("\n", " ")
-summary = f"Turn summary: {len(tools)} tool calls ({top3}); response excerpt: {text[:120]}"
-print(summary)
-PY
-)
-
-# Complexity: tool count / 10, capped at 0.85.
-COMPLEXITY=$(python3 - "${PAYLOAD}" <<'PY'
-import json, sys
-raw = sys.argv[1] if len(sys.argv) > 1 else "{}"
-try:
-    p = json.loads(raw)
-except Exception:
-    p = {}
-n = len(p.get("tool_calls", []) or [])
-print(f"{min(n/10.0, 0.85):.3f}")
-PY
-)
+SUMMARY=$(_stop_field summary)
+COMPLEXITY=$(_stop_field complexity)
 
 python3 "${PLUGIN_ROOT}/scripts/checkin.py" \
   --event turn_stop \
@@ -195,6 +239,7 @@ python3 "${PLUGIN_ROOT}/scripts/checkin.py" \
   --client-session-id "${CSID}" \
   --uuid "${UUID}" \
   --slot "${SLOT:-${RAW_SLOT:-}}" \
+  --timeout "${CHECKIN_TIMEOUT}" \
   >/dev/null 2>&1 || true
 
 exit 0

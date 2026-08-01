@@ -15,6 +15,14 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+HOOK_HOST="claude"
+if [[ "${1:-}" == "--host" && -n "${2:-}" ]]; then
+  HOOK_HOST="$2"
+fi
+if [[ "${HOOK_HOST}" != "claude" && "${HOOK_HOST}" != "codex" ]]; then
+  exit 0
+fi
+
 # Diagnostic breadcrumb (off by default). When UNITARES_HOOK_DEBUG=1, append
 # one line per silent-exit so operators can see where the chain breaks
 # without changing user-visible behavior. Path overridable via
@@ -53,14 +61,41 @@ if [[ -z "${HOOK_INPUT}" ]]; then
   exit 0
 fi
 
+# PostToolUse may run asynchronously on Claude, so a response can arrive after
+# another identity writer or a session clear. PreToolUse records the slot's
+# generation under this exact tool ID; the cache helper consumes it as a CAS.
+TOOL_USE_ID=$(python3 - "${HOOK_INPUT}" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+try:
+    payload = json.loads(sys.argv[1])
+except Exception:
+    payload = {}
+print(payload.get("tool_use_id") or payload.get("tool_call_id") or "")
+PY
+)
+_discard_generation_snapshot() {
+  python3 "${SESSION_CACHE_HELPER}" discard-session-snapshot \
+    --workspace "${PWD}" \
+    --event-id "${TOOL_USE_ID}" >/dev/null 2>&1 || true
+}
+if [[ -n "${TOOL_USE_ID}" ]]; then
+  trap _discard_generation_snapshot EXIT
+fi
+
 # Extract session_id (slot), tool_name, and the response payload that matters.
 # MCP tool responses arrive wrapped as {"content": [{"type":"text","text":"<JSON>"}]}.
 # The inner JSON contains uuid, agent_id, client_session_id, continuity_token,
 # display_name. We only record for the four identity-creating/resuming tools.
 # HOOK_INPUT goes via argv[1] rather than stdin because the heredoc below
 # redirects stdin from itself — piping into `python3 - <<'PY'` would be lost.
-EXTRACTED=$(python3 - "${HOOK_INPUT}" "${PLUGIN_ROOT}/scripts" <<'PY' 2>/dev/null || true
+EXTRACTED=$(python3 - "${HOOK_INPUT}" "${PLUGIN_ROOT}/scripts" "${HOOK_HOST}" <<'PY' 2>/dev/null || true
 import json, os, sys
+
+sys.path.insert(0, sys.argv[2])
+
+from governance_tool_name import governance_tool_suffix
 
 def _skip(reason):
     # Emitted on stdout where bash captures EXTRACTED. The bash side
@@ -75,12 +110,14 @@ try:
 except Exception:
     _skip("hook_input_not_json")
 
-tool_name = (data.get("tool_name") or "").lower()
-# Match mcp__<server>__(onboard|start_session|identity|bind_session).
+tool_name = data.get("tool_name") or ""
+# Match only configured UNITARES aliases for the identity tools. The manifest
+# matcher is intentionally broad, so suffix-only matching here would let a
+# foreign MCP server overwrite the slot cache with its own UUID response.
 # start_session is the friendly-workflow alias for onboard — without it,
 # alias-onboarded sessions never write the slot cache and run dark.
 _id_tools = ("onboard", "start_session", "identity", "bind_session")
-suffix = tool_name.rsplit("__", 1)[-1] if "__" in tool_name else tool_name
+suffix = governance_tool_suffix(tool_name, host=sys.argv[3])
 if suffix not in _id_tools:
     _skip(f"tool_name_mismatch:{tool_name or 'empty'}")
 
@@ -97,14 +134,11 @@ if isinstance(_tool_input, dict):
     if str(_tool_input.get("spawn_reason") or "").strip().lower() == "subagent":
         _skip("subagent_onboard_not_cached")
 
-session_id = data.get("session_id") or ""
-if not session_id:
-    try:
-        sys.path.insert(0, sys.argv[2])
-        from _slot_from_stdin import slot_from_payload
-        session_id = slot_from_payload(sys.argv[1])
-    except Exception:
-        session_id = ""
+try:
+    from _slot_from_stdin import slot_from_payload
+    session_id = slot_from_payload(sys.argv[1])
+except Exception:
+    session_id = ""
 
 resp = data.get("tool_response")
 # Claude Code delivers MCP tool responses in two observed shapes:
@@ -127,11 +161,46 @@ if parts and isinstance(parts[0], dict):
 
 if not isinstance(resp, dict):
     _skip("response_not_dict")
-if not resp.get("success", True):
+
+# Friendly workflow tools wrap the canonical response under raw_governance and
+# lift only the fields intended for the common agent path. Keep accepting the
+# direct canonical shape used by onboard/identity/bind_session.
+canonical = resp.get("raw_governance")
+if not isinstance(canonical, dict):
+    canonical = {}
+
+response_success = resp.get("success")
+if response_success is None:
+    response_success = canonical.get("success", True)
+if not response_success:
     _skip("response_success_false")
 
+bound_identity = resp.get("bound_identity")
+if not isinstance(bound_identity, dict):
+    bound_identity = {}
+canonical_bound_identity = canonical.get("bound_identity")
+if not isinstance(canonical_bound_identity, dict):
+    canonical_bound_identity = {}
+
+def _response_field(name, default=""):
+    value = resp.get(name)
+    if value not in (None, ""):
+        return value
+    value = canonical.get(name)
+    if value not in (None, ""):
+        return value
+    return default
+
 # Only record if we actually got a UUID — otherwise nothing useful to cache.
-uuid_val = resp.get("uuid") or (resp.get("bound_identity") or {}).get("uuid")
+# start_session lifts the canonical uuid as agent_uuid in its friendly envelope.
+uuid_val = (
+    resp.get("agent_uuid")
+    or resp.get("uuid")
+    or canonical.get("agent_uuid")
+    or canonical.get("uuid")
+    or bound_identity.get("uuid")
+    or canonical_bound_identity.get("uuid")
+)
 if not uuid_val:
     _skip("no_uuid_in_response")
 
@@ -169,12 +238,20 @@ if suffix in ("identity", "bind_session"):
 # are treated as read-only legacy — readers ignore their token field.
 payload = {
     "uuid": uuid_val,
-    "agent_id": resp.get("agent_id", "") or (resp.get("bound_identity") or {}).get("agent_id", ""),
-    "client_session_id": resp.get("client_session_id", ""),
+    "agent_id": (
+        _response_field("agent_id")
+        or bound_identity.get("agent_id", "")
+        or canonical_bound_identity.get("agent_id", "")
+    ),
+    "client_session_id": _response_field("client_session_id"),
     "continuity_token": "",
-    "display_name": resp.get("display_name", "") or (resp.get("bound_identity") or {}).get("display_name", ""),
-    "continuity_token_supported": resp.get("continuity_token_supported", False),
-    "session_resolution_source": resp.get("session_resolution_source", ""),
+    "display_name": (
+        _response_field("display_name")
+        or bound_identity.get("display_name", "")
+        or canonical_bound_identity.get("display_name", "")
+    ),
+    "continuity_token_supported": _response_field("continuity_token_supported", False),
+    "session_resolution_source": _response_field("session_resolution_source"),
     "slot": session_id,
     "schema_version": 2,
 }
@@ -204,6 +281,11 @@ if [[ -z "${PAYLOAD}" || "${PAYLOAD}" == "{}" ]]; then
   exit 0
 fi
 
+if [[ -z "${TOOL_USE_ID}" ]]; then
+  _breadcrumb missing_tool_use_id_for_generation_commit
+  exit 0
+fi
+
 # Merge into slot-scoped session cache. --merge preserves any fields the
 # session-start hook wrote earlier (e.g. server_url, agent_name) while
 # overwriting uuid/token/etc. from this response.
@@ -218,6 +300,7 @@ python3 "${SESSION_CACHE_HELPER}" \
   "${SLOT_ARG[@]}" \
   --merge \
   --stamp \
+  --snapshot-id "${TOOL_USE_ID}" \
   --json "${PAYLOAD}" >/dev/null 2>&1 || true
 
 exit 0

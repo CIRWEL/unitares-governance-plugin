@@ -37,20 +37,36 @@ readers who grep for ``schema_version`` or ``continuity_token`` here.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _session_cache_io import (  # noqa: E402
+    clear_session_cache,
+    reserve_session_cache_snapshot,
+    update_session_cache,
+)
 
 CACHE_DIR = ".unitares"
 CACHE_FILES = {
     "session": "session.json",
     "milestone": "last-milestone.json",
 }
+DEFAULT_MILESTONE_LOCK_TIMEOUT_S = 2.0
+DEFAULT_MILESTONE_DELIVERY_CLAIM_TTL_S = 30.0
+MIN_MILESTONE_DELIVERY_CLAIM_TTL_S = 30.0
+DEFAULT_MILESTONE_SNAPSHOT_MAX_AGE_S = 900.0
+DEFAULT_SESSION_SNAPSHOT_MAX_AGE_S = 900.0
 
 # Mirrors the post-sanitization shape produced by `_slot_suffix`. Used by
 # `_parse_session_filename` to reject filenames that bypassed the writer
@@ -58,6 +74,10 @@ CACHE_FILES = {
 # the parsed slot is later reflected into agent context, where backticks
 # or whitespace would break the surrounding markdown code-span).
 _SLOT_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_UUID_PATTERN = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 
 
 def _workspace_path(raw: str | None) -> Path:
@@ -128,6 +148,98 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
+def _bounded_lock_timeout_s(env_name: str, default: float) -> float:
+    raw = os.environ.get(env_name, str(default))
+    try:
+        return min(4.0, max(0.05, float(raw)))
+    except ValueError:
+        return default
+
+
+def _milestone_lock_timeout_s() -> float:
+    return _bounded_lock_timeout_s(
+        "UNITARES_MILESTONE_LOCK_TIMEOUT_S",
+        DEFAULT_MILESTONE_LOCK_TIMEOUT_S,
+    )
+
+
+@contextmanager
+def _cache_lock(
+    path: Path,
+    *,
+    timeout_s: float,
+    label: str,
+) -> Iterator[None]:
+    """Serialize read-modify-write cycles across client processes.
+
+    The lock lives in a stable sidecar because ``_write_json`` atomically
+    replaces the JSON inode. Locking the JSON file itself would let a second
+    process lock the replacement while the first still holds the unlinked
+    predecessor.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(".lock")
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(lock_path, flags, 0o600)
+    acquired = False
+    deadline = time.monotonic() + timeout_s
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            # msvcrt locks a byte range from the current offset. Keep one byte
+            # in the sidecar so the same region exists for every process.
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            while not acquired:
+                os.lseek(fd, 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"{label} lock timed out: {lock_path}")
+                    time.sleep(0.025)
+        else:
+            import fcntl
+
+            while not acquired:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"{label} lock timed out: {lock_path}")
+                    time.sleep(0.025)
+        yield
+    finally:
+        if acquired:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@contextmanager
+def _milestone_lock(path: Path) -> Iterator[None]:
+    with _cache_lock(
+        path,
+        timeout_s=_milestone_lock_timeout_s(),
+        label="milestone",
+    ):
+        yield
+
+
 def _load_payload(args: argparse.Namespace) -> dict[str, Any]:
     raw = args.json
     if raw is None and not sys.stdin.isatty():
@@ -189,9 +301,52 @@ def cmd_set(args: argparse.Namespace) -> int:
 
     path = _cache_path(args.kind, workspace, slot)
     payload = _load_payload(args)
-    if args.merge:
-        existing = _read_json(path)
-        if args.kind == "session":
+    if args.kind == "milestone":
+        with _milestone_lock(path):
+            if args.merge:
+                existing = _read_json(path)
+                existing.update(payload)
+                payload = existing
+            if args.stamp:
+                payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _write_json(path, payload)
+        if args.echo:
+            print(json.dumps(payload))
+        return 0
+
+    result_code = 0
+    expected_generation: int | None = None
+    expected_authority_generation: int | None = None
+    snapshot_path: Path | None = None
+    snapshot_id = str(getattr(args, "snapshot_id", "") or "").strip()
+    if snapshot_id:
+        if not slot:
+            print(
+                "session_cache.py: --snapshot-id requires a slotted session write",
+                file=sys.stderr,
+            )
+            return 2
+        snapshot_path = _session_snapshot_path(workspace, snapshot_id)
+        snapshot = _read_json(snapshot_path)
+        if (
+            snapshot.get("schema_version") != 1
+            or snapshot.get("event_id") != snapshot_id
+            or _slot_suffix(str(snapshot.get("slot") or "")) != _slot_suffix(slot)
+            or not isinstance(snapshot.get("generation"), int)
+            or not isinstance(snapshot.get("authority_generation"), int)
+        ):
+            print(
+                "session_cache.py: identity generation snapshot missing or invalid; "
+                "session cache unchanged",
+                file=sys.stderr,
+            )
+            return 3
+        expected_generation = snapshot["generation"]
+        expected_authority_generation = snapshot.get("authority_generation")
+
+    def update_session(existing: dict[str, Any]) -> dict[str, Any] | None:
+        nonlocal payload, result_code
+        if args.merge:
             # Auto-migrate v1 legacy tokens during merge: a pre-existing
             # slot file from before S11/S20 may carry a real continuity_token
             # at rest. Without this strip, the token-rejection check below
@@ -209,10 +364,9 @@ def cmd_set(args: argparse.Namespace) -> int:
                     f"continuity_token from {path} during merge",
                     file=sys.stderr,
                 )
-        existing.update(payload)
-        payload = existing
+            existing.update(payload)
+            payload = existing
 
-    if args.kind == "session":
         token = payload.get("continuity_token")
         # Literal empty string is the v2 hook erasure path (passes). Any
         # non-empty string is rejected — including whitespace-only values,
@@ -226,7 +380,8 @@ def cmd_set(args: argparse.Namespace) -> int:
                 "to recover a legacy slot file, run: clear session --slot <id>)",
                 file=sys.stderr,
             )
-            return 2
+            result_code = 2
+            return None
         if not any(k in payload for k in _SESSION_IDENTITY_FIELDS):
             # A session cache with neither uuid nor client_session_id
             # is a stub: subsequent hooks read it, find no addressable identity,
@@ -238,39 +393,48 @@ def cmd_set(args: argparse.Namespace) -> int:
                 f"(need at least one of {list(_SESSION_IDENTITY_FIELDS)})",
                 file=sys.stderr,
             )
-            return 1
+            result_code = 1
+            return None
 
-    if args.stamp:
-        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _write_json(path, payload)
+        if args.stamp:
+            payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return payload
 
-    # Slotted HOME mirror for session caches (2026-05-30).
-    # `_session_lookup.resolve_session_file` has a slotted-HOME fallback
-    # added 2026-05-10 to fix the PWD-mismatch failure mode where
-    # post-identity writes from PWD=X but a later hook reads from PWD=Y and
-    # misses. The fix was read-side only — the writer never populated HOME,
-    # so the fallback never had a file to find. This mirror closes the loop:
-    # session writes hit BOTH workspace AND $HOME/.unitares/session-<slot>.json,
-    # so the slotted-HOME read fallback actually works.
-    #
-    # Identity-honesty unchanged: slot is the Claude Code session_id, globally
-    # unique per session, so cross-agent siphoning is structurally precluded
-    # (cf. the unslotted-HOME removal noted in _session_lookup.py). Milestone
-    # accumulator stays workspace-scoped per the auto-checkin design.
-    if args.kind == "session" and slot:
-        home_path = _cache_path("session", Path.home(), slot)
-        if home_path != path:
-            try:
-                _write_json(home_path, payload)
-            except Exception as exc:
-                # Best-effort — primary workspace write already succeeded.
-                # Failure here only loses the PWD-mismatch fallback path,
-                # not the primary cache.
-                print(
-                    f"session_cache.py: home-mirror write failed ({exc!r}) — "
-                    f"primary cache at {path} unaffected",
-                    file=sys.stderr,
-                )
+    def mirror_error(home_path: Path, exc: Exception) -> None:
+        print(
+            f"session_cache.py: home-mirror write failed ({exc!r}); "
+            f"invalidated stale fallback at {home_path}",
+            file=sys.stderr,
+        )
+
+    home_path = _cache_path("session", Path.home(), slot) if slot else None
+    try:
+        authoritative, committed = update_session_cache(
+            path,
+            update_session,
+            home_path=home_path,
+            expected_generation=expected_generation,
+            expected_authority_generation=expected_authority_generation,
+            on_mirror_error=mirror_error,
+        )
+    finally:
+        if snapshot_path is not None:
+            _discard_session_snapshot_file(
+                snapshot_path,
+                event_id=snapshot_id,
+                generation=expected_generation,
+            )
+    if result_code:
+        return result_code
+    if snapshot_id and not committed:
+        print(
+            "session_cache.py: identity generation changed while the tool call "
+            "was in flight; stale response ignored",
+            file=sys.stderr,
+        )
+        return 4
+    if committed:
+        payload = authoritative
 
     if args.echo:
         print(json.dumps(payload))
@@ -279,11 +443,16 @@ def cmd_set(args: argparse.Namespace) -> int:
 
 def cmd_clear(args: argparse.Namespace) -> int:
     workspace = _workspace_path(args.workspace)
-    path = _cache_path(args.kind, workspace, getattr(args, "slot", None))
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
+    slot = getattr(args, "slot", None)
+    path = _cache_path(args.kind, workspace, slot)
+
+    if args.kind == "milestone":
+        with _milestone_lock(path):
+            path.unlink(missing_ok=True)
+        return 0
+
+    home_path = _cache_path("session", Path.home(), slot) if slot else None
+    clear_session_cache(path, home_path=home_path)
     return 0
 
 
@@ -316,11 +485,12 @@ def cmd_list(args: argparse.Namespace) -> int:
     — declared lineage, not resume. The scan-newest fallback (S20 §2b) is
     a *lineage candidate surface*, never a resume credential.
 
-    Entries with neither identity field are filtered: a null-identity row
-    has no actionable lineage hint and would silently mis-rank the
-    scan-newest pick if it sorted to the top by ``updated_at``. Malformed
-    JSON is skipped silently — this is a discovery surface, not a
-    validator.
+    Entries without a shape-valid UUID are filtered: they have no actionable
+    lineage hint and would silently mis-rank the scan-newest pick if sorted to
+    the top by ``updated_at``. The UUID check is also a trust boundary: cache
+    files live in the workspace, and their values may later be reflected into
+    host-provided developer context. Malformed JSON is skipped silently — this
+    is a discovery surface, not a validator.
     """
     workspace = _workspace_path(args.workspace)
     cache_dir = workspace / CACHE_DIR
@@ -339,9 +509,9 @@ def cmd_list(args: argparse.Namespace) -> int:
             if not data:
                 continue
             uuid = data.get("uuid")
-            sid = data.get("client_session_id")
-            if not uuid and not sid:
+            if not isinstance(uuid, str) or not _UUID_PATTERN.fullmatch(uuid):
                 continue
+            sid = data.get("client_session_id")
             entries.append({
                 "slot": slot,
                 "parent_agent_id": uuid,
@@ -380,60 +550,328 @@ def cmd_list(args: argparse.Namespace) -> int:
 MILESTONE_FILE_CAP = 20
 
 
+def _milestone_snapshot_path(workspace: Path, event_id: str) -> Path:
+    digest = hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:24]
+    return workspace / CACHE_DIR / "milestone-snapshots" / f"{digest}.json"
+
+
+def _session_snapshot_path(workspace: Path, event_id: str) -> Path:
+    digest = hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:24]
+    return workspace / CACHE_DIR / "session-snapshots" / f"{digest}.json"
+
+
+def _milestone_delivery_claim_path(workspace: Path) -> Path:
+    return workspace / CACHE_DIR / "milestone-delivery-claim.json"
+
+
+def _snapshot_created_epoch(path: Path, payload: dict[str, Any]) -> float:
+    raw = payload.get("created_at")
+    if isinstance(raw, str) and raw:
+        try:
+            created = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            return created.timestamp()
+        except (ValueError, OverflowError):
+            pass
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _prune_session_snapshots(
+    workspace: Path,
+    *,
+    now: float | None = None,
+) -> int:
+    directory = workspace / CACHE_DIR / "session-snapshots"
+    if not directory.is_dir():
+        return 0
+    cutoff = (time.time() if now is None else now) - DEFAULT_SESSION_SNAPSHOT_MAX_AGE_S
+    removed = 0
+    for path in directory.glob("*.json"):
+        if _snapshot_created_epoch(path, _read_json(path)) >= cutoff:
+            continue
+        path.unlink(missing_ok=True)
+        removed += 1
+    return removed
+
+
+def _discard_session_snapshot_file(
+    path: Path,
+    *,
+    event_id: str,
+    generation: int | None = None,
+) -> bool:
+    snapshot = _read_json(path)
+    if snapshot.get("event_id") != event_id:
+        return False
+    if generation is not None and snapshot.get("generation") != generation:
+        return False
+    path.unlink(missing_ok=True)
+    return True
+
+
+def cmd_snapshot_session(args: argparse.Namespace) -> int:
+    """Capture a cache generation before an identity MCP call starts."""
+    slot = _slot_suffix(args.slot.strip())
+    if not slot:
+        raise ValueError("snapshot-session requires a non-empty --slot")
+    workspace = _workspace_path(args.workspace)
+    path = _cache_path("session", workspace, slot)
+    home_path = _cache_path("session", Path.home(), slot)
+    _, generation, authority_generation = reserve_session_cache_snapshot(
+        path,
+        home_path=home_path,
+    )
+    _prune_session_snapshots(workspace)
+    snapshot = {
+        "schema_version": 1,
+        "event_id": args.event_id,
+        "slot": slot,
+        "generation": generation,
+        "authority_generation": authority_generation,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_json(_session_snapshot_path(workspace, args.event_id), snapshot)
+    if args.echo:
+        print(json.dumps(snapshot))
+    return 0
+
+
+def cmd_discard_session_snapshot(args: argparse.Namespace) -> int:
+    """Discard an identity-call snapshot after a non-cacheable response."""
+    workspace = _workspace_path(args.workspace)
+    _discard_session_snapshot_file(
+        _session_snapshot_path(workspace, args.event_id),
+        event_id=args.event_id,
+    )
+    return 0
+
+
+def _prune_milestone_snapshots(
+    workspace: Path,
+    *,
+    now: float | None = None,
+) -> int:
+    """Remove stale tool snapshots without touching another live session."""
+    directory = workspace / CACHE_DIR / "milestone-snapshots"
+    if not directory.is_dir():
+        return 0
+    cutoff = (time.time() if now is None else now) - DEFAULT_MILESTONE_SNAPSHOT_MAX_AGE_S
+    removed = 0
+    for path in directory.glob("*.json"):
+        if _snapshot_created_epoch(path, _read_json(path)) >= cutoff:
+            continue
+        path.unlink(missing_ok=True)
+        removed += 1
+    return removed
+
+
+def cmd_claim_milestone_delivery(args: argparse.Namespace) -> int:
+    """Claim the single in-flight auto-checkin delivery slot for a workspace."""
+    workspace = _workspace_path(args.workspace)
+    milestone_path = _cache_path("milestone", workspace)
+    claim_path = _milestone_delivery_claim_path(workspace)
+    now = time.time()
+    # checkin.py's edit delivery can use its full 20-second HTTP timeout. Keep
+    # the claim alive beyond that transport budget so a slow accepted response
+    # cannot overlap a replacement claimant.
+    ttl = min(120.0, max(MIN_MILESTONE_DELIVERY_CLAIM_TTL_S, float(args.ttl)))
+
+    with _milestone_lock(milestone_path):
+        existing = _read_json(claim_path)
+        try:
+            expires_at = float(existing.get("expires_at") or 0)
+        except (TypeError, ValueError):
+            expires_at = 0
+        existing_owner = existing.get("owner")
+        active = isinstance(existing_owner, str) and bool(existing_owner) and expires_at > now
+
+        if active and existing_owner != args.owner:
+            result = {
+                "claimed": False,
+                "owner": args.owner,
+                "held_revision": existing.get("revision"),
+                "expires_at": expires_at,
+            }
+        else:
+            result = {
+                "schema_version": 1,
+                "claimed": True,
+                "owner": args.owner,
+                "revision": args.revision,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "expires_at": now + ttl,
+            }
+            _write_json(claim_path, result)
+
+    if args.echo:
+        print(json.dumps(result))
+    return 0
+
+
+def cmd_release_milestone_delivery(args: argparse.Namespace) -> int:
+    """Release an auto-checkin delivery claim only when its owner matches."""
+    workspace = _workspace_path(args.workspace)
+    milestone_path = _cache_path("milestone", workspace)
+    claim_path = _milestone_delivery_claim_path(workspace)
+
+    with _milestone_lock(milestone_path):
+        existing = _read_json(claim_path)
+        released = existing.get("owner") == args.owner
+        if released:
+            claim_path.unlink(missing_ok=True)
+
+    if args.echo:
+        print(json.dumps({"released": released}))
+    return 0
+
+
+def cmd_snapshot_milestone(args: argparse.Namespace) -> int:
+    """Capture the pre-tool revision a later PostToolUse may acknowledge."""
+    if not args.slot.strip():
+        raise ValueError("snapshot-milestone requires a non-empty --slot")
+    workspace = _workspace_path(args.workspace)
+    milestone_path = _cache_path("milestone", workspace)
+    snapshot_path = _milestone_snapshot_path(workspace, args.event_id)
+    with _milestone_lock(milestone_path):
+        _prune_milestone_snapshots(workspace)
+        existing = _read_json(milestone_path)
+        snapshot = {
+            "schema_version": 1,
+            "event_id": args.event_id,
+            "slot": args.slot,
+            "revision": int(existing.get("revision") or 0),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _write_json(snapshot_path, snapshot)
+    if args.echo:
+        print(json.dumps(snapshot))
+    return 0
+
+
+def cmd_discard_milestone_snapshot(args: argparse.Namespace) -> int:
+    """Discard a tool-scoped snapshot without acknowledging its edits."""
+    workspace = _workspace_path(args.workspace)
+    snapshot_path = _milestone_snapshot_path(workspace, args.event_id)
+    snapshot = _read_json(snapshot_path)
+    if snapshot.get("event_id") == args.event_id:
+        snapshot_path.unlink(missing_ok=True)
+    return 0
+
+
+def cmd_discard_milestone_snapshots(args: argparse.Namespace) -> int:
+    """Discard only snapshots owned by one exact host session slot."""
+    workspace = _workspace_path(args.workspace)
+    milestone_path = _cache_path("milestone", workspace)
+    directory = workspace / CACHE_DIR / "milestone-snapshots"
+    removed = 0
+    with _milestone_lock(milestone_path):
+        if directory.is_dir():
+            for path in directory.glob("*.json"):
+                if _read_json(path).get("slot") != args.slot:
+                    continue
+                path.unlink(missing_ok=True)
+                removed += 1
+        _prune_milestone_snapshots(workspace)
+    if args.echo:
+        print(json.dumps({"removed": removed}))
+    return 0
+
+
 def cmd_bump_edit(args: argparse.Namespace) -> int:
     """Append an edit event to the milestone accumulator.
 
-    Increments edit_count, dedupes file_path into files_touched (capped),
+    Increments edit_count once, merges all event paths into files_touched (capped),
     stamps first_edit_ts on the first bump since reset, and always refreshes
     last_edit_ts + updated_at. Backwards-compatible keys (event, file_path,
     timestamp) are preserved so existing readers keep working.
     """
     workspace = _workspace_path(args.workspace)
     path = _cache_path("milestone", workspace)
-    existing = _read_json(path)
+    with _milestone_lock(path):
+        existing = _read_json(path)
 
-    now_epoch = int(datetime.now(timezone.utc).timestamp())
-    now_iso = datetime.now(timezone.utc).isoformat()
+        now_epoch = int(datetime.now(timezone.utc).timestamp())
+        now_iso = datetime.now(timezone.utc).isoformat()
 
-    existing["edit_count"] = int(existing.get("edit_count") or 0) + 1
-    if not existing.get("first_edit_ts"):
-        existing["first_edit_ts"] = now_epoch
-    existing["last_edit_ts"] = now_epoch
-    existing["updated_at"] = now_iso
+        existing["revision"] = int(existing.get("revision") or 0) + 1
+        existing["edit_count"] = int(existing.get("edit_count") or 0) + 1
+        if not existing.get("first_edit_ts"):
+            existing["first_edit_ts"] = now_epoch
+        existing["last_edit_ts"] = now_epoch
+        existing["updated_at"] = now_iso
 
-    files = existing.get("files_touched")
-    if not isinstance(files, list):
-        files = []
-    fp = (args.file_path or "").strip()
-    if fp and fp not in files:
-        files.append(fp)
+        files = existing.get("files_touched")
+        if not isinstance(files, list):
+            files = []
+        raw_paths = args.file_path or []
+        if isinstance(raw_paths, str):
+            raw_paths = [raw_paths]
+        if args.file_paths_json:
+            decoded = json.loads(args.file_paths_json)
+            if not isinstance(decoded, list) or not all(isinstance(item, str) for item in decoded):
+                raise ValueError("--file-paths-json must be a JSON array of strings")
+            raw_paths.extend(decoded)
+        event_paths = list(dict.fromkeys(path.strip() for path in raw_paths if path.strip()))
+        for file_path in event_paths:
+            if file_path not in files:
+                files.append(file_path)
         if len(files) > MILESTONE_FILE_CAP:
             files = files[-MILESTONE_FILE_CAP:]
-    existing["files_touched"] = files
+        existing["files_touched"] = files
 
-    # Legacy shape — keep for readers that predate the accumulator.
-    existing.setdefault("event", "edit")
-    if fp:
-        existing["file_path"] = fp
-    existing["timestamp"] = now_epoch
+        # Legacy shape — keep for readers that predate the accumulator.
+        existing.setdefault("event", "edit")
+        if event_paths:
+            existing["file_path"] = event_paths[-1]
+        existing["timestamp"] = now_epoch
 
-    _write_json(path, existing)
+        _write_json(path, existing)
     if args.echo:
         print(json.dumps(existing))
     return 0
 
 
 def cmd_reset_milestone(args: argparse.Namespace) -> int:
-    """Reset the milestone accumulator after a successful check-in."""
+    """Reset edits acknowledged by a check-in unless a newer bump landed."""
     workspace = _workspace_path(args.workspace)
     path = _cache_path("milestone", workspace)
-    existing = _read_json(path)
-    existing["edit_count"] = 0
-    existing["files_touched"] = []
-    existing["first_edit_ts"] = None
-    existing["last_edit_ts"] = None
-    existing["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _write_json(path, existing)
+    with _milestone_lock(path):
+        existing = _read_json(path)
+        expected_revision = getattr(args, "expected_revision", None)
+        snapshot_id = getattr(args, "snapshot_id", None)
+        if snapshot_id:
+            snapshot_path = _milestone_snapshot_path(workspace, snapshot_id)
+            snapshot = _read_json(snapshot_path)
+            snapshot_path.unlink(missing_ok=True)
+            if snapshot.get("event_id") == snapshot_id and isinstance(
+                snapshot.get("revision"), int
+            ):
+                expected_revision = snapshot["revision"]
+            else:
+                if args.echo:
+                    output = dict(existing)
+                    output["reset_skipped"] = True
+                    output["reset_skip_reason"] = "snapshot_missing"
+                    print(json.dumps(output))
+                return 0
+        current_revision = int(existing.get("revision") or 0)
+        if expected_revision is not None and current_revision != expected_revision:
+            if args.echo:
+                output = dict(existing)
+                output["reset_skipped"] = True
+                print(json.dumps(output))
+            return 0
+        existing["revision"] = current_revision + 1
+        existing["edit_count"] = 0
+        existing["files_touched"] = []
+        existing["first_edit_ts"] = None
+        existing["last_edit_ts"] = None
+        existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _write_json(path, existing)
     if args.echo:
         print(json.dumps(existing))
     return 0
@@ -474,6 +912,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_set.add_argument("--json")
     p_set.add_argument("--merge", action="store_true")
     p_set.add_argument("--stamp", action="store_true")
+    p_set.add_argument(
+        "--snapshot-id",
+        default="",
+        help="Commit a session write only if this pre-tool generation still matches.",
+    )
     p_set.add_argument("--echo", action="store_true")
     p_set.set_defaults(func=cmd_set)
 
@@ -490,20 +933,101 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--workspace")
     p_list.set_defaults(func=cmd_list)
 
+    p_snapshot_session = sub.add_parser(
+        "snapshot-session",
+        help="Capture the current session generation before an identity tool call",
+    )
+    p_snapshot_session.add_argument("--workspace")
+    p_snapshot_session.add_argument("--event-id", required=True)
+    p_snapshot_session.add_argument("--slot", required=True)
+    p_snapshot_session.add_argument("--echo", action="store_true")
+    p_snapshot_session.set_defaults(func=cmd_snapshot_session)
+
+    p_discard_session_snapshot = sub.add_parser(
+        "discard-session-snapshot",
+        help="Discard one identity-call generation snapshot",
+    )
+    p_discard_session_snapshot.add_argument("--workspace")
+    p_discard_session_snapshot.add_argument("--event-id", required=True)
+    p_discard_session_snapshot.set_defaults(func=cmd_discard_session_snapshot)
+
     p_bump = sub.add_parser(
         "bump-edit",
         help="Append an edit event to the milestone accumulator",
     )
     p_bump.add_argument("--workspace")
-    p_bump.add_argument("--file-path", default="")
+    p_bump.add_argument("--file-path", action="append", default=[])
+    p_bump.add_argument("--file-paths-json", default="")
     p_bump.add_argument("--echo", action="store_true")
     p_bump.set_defaults(func=cmd_bump_edit)
+
+    p_claim_delivery = sub.add_parser(
+        "claim-milestone-delivery",
+        help="Claim the workspace auto-checkin delivery slot",
+    )
+    p_claim_delivery.add_argument("--workspace")
+    p_claim_delivery.add_argument("--revision", type=int, required=True)
+    p_claim_delivery.add_argument("--owner", required=True)
+    p_claim_delivery.add_argument(
+        "--ttl",
+        type=float,
+        default=DEFAULT_MILESTONE_DELIVERY_CLAIM_TTL_S,
+    )
+    p_claim_delivery.add_argument("--echo", action="store_true")
+    p_claim_delivery.set_defaults(func=cmd_claim_milestone_delivery)
+
+    p_release_delivery = sub.add_parser(
+        "release-milestone-delivery",
+        help="Release the matching workspace auto-checkin delivery claim",
+    )
+    p_release_delivery.add_argument("--workspace")
+    p_release_delivery.add_argument("--owner", required=True)
+    p_release_delivery.add_argument("--echo", action="store_true")
+    p_release_delivery.set_defaults(func=cmd_release_milestone_delivery)
+
+    p_snapshot = sub.add_parser(
+        "snapshot-milestone",
+        help="Capture the current revision before a check-in tool call",
+    )
+    p_snapshot.add_argument("--workspace")
+    p_snapshot.add_argument("--event-id", required=True)
+    p_snapshot.add_argument("--slot", required=True)
+    p_snapshot.add_argument("--echo", action="store_true")
+    p_snapshot.set_defaults(func=cmd_snapshot_milestone)
+
+    p_discard_snapshot = sub.add_parser(
+        "discard-milestone-snapshot",
+        help="Discard a failed check-in's revision snapshot without resetting edits",
+    )
+    p_discard_snapshot.add_argument("--workspace")
+    p_discard_snapshot.add_argument("--event-id", required=True)
+    p_discard_snapshot.set_defaults(func=cmd_discard_milestone_snapshot)
+
+    p_discard_snapshots = sub.add_parser(
+        "discard-milestone-snapshots",
+        help="Discard revision snapshots owned by one host session slot",
+    )
+    p_discard_snapshots.add_argument("--workspace")
+    p_discard_snapshots.add_argument("--slot", required=True)
+    p_discard_snapshots.add_argument("--echo", action="store_true")
+    p_discard_snapshots.set_defaults(func=cmd_discard_milestone_snapshots)
 
     p_reset = sub.add_parser(
         "reset-milestone",
         help="Reset the milestone accumulator after a check-in",
     )
     p_reset.add_argument("--workspace")
+    p_reset.add_argument(
+        "--expected-revision",
+        type=int,
+        default=None,
+        help="Reset only when no newer edit event has changed this revision.",
+    )
+    p_reset.add_argument(
+        "--snapshot-id",
+        default="",
+        help="Consume a pre-tool revision snapshot keyed by tool_use_id.",
+    )
     p_reset.add_argument("--echo", action="store_true")
     p_reset.set_defaults(func=cmd_reset_milestone)
 

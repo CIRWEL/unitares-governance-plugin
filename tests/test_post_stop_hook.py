@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import socketserver
 import subprocess
 import sys
 import threading
@@ -73,14 +72,12 @@ def test_post_stop_emits_turn_stop_checkin(tmp_path):
         "slot": slot,
     }))
 
-    # Minimal Stop hook payload: tool_calls list + final_text
+    # Current Claude Stop payload: the tool count is not included.
     stop_payload = json.dumps({
         "hook_event_name": "Stop",
         "session_id": slot,
-        "tool_calls": [
-            {"name": "Read"}, {"name": "Edit"}, {"name": "Bash"}
-        ],
-        "final_text": "Completed the refactor; all tests pass.",
+        "stop_hook_active": False,
+        "last_assistant_message": "Completed the refactor; all tests pass.",
     })
 
     try:
@@ -119,7 +116,7 @@ def test_post_stop_emits_turn_stop_checkin(tmp_path):
         f"{[c.get('name') for c in RecordingHandler.calls]}"
     )
     text = checkins[0]["arguments"]["response_text"]
-    assert "3 tool call" in text
+    assert "tool count unavailable" in text
     assert "Completed the refactor" in text
     assert checkins[0]["arguments"]["epistemic_class"] == "substrate_interpretation"
     assert "continuity_token" not in checkins[0]["arguments"]
@@ -139,8 +136,8 @@ def test_post_stop_lazy_onboards_when_cache_missing(tmp_path):
     stop_payload = json.dumps({
         "hook_event_name": "Stop",
         "session_id": slot,
-        "tool_calls": [{"name": "Read"}],
-        "final_text": "Inspected governance status.",
+        "stop_hook_active": False,
+        "last_assistant_message": "Inspected governance status.",
     })
 
     try:
@@ -169,6 +166,7 @@ def test_post_stop_lazy_onboards_when_cache_missing(tmp_path):
 
     tool_names = [c.get("name") for c in LazyOnboardHandler.calls]
     assert tool_names == ["onboard", "process_agent_update"]
+    assert LazyOnboardHandler.calls[0]["arguments"]["model_type"] == "claude-code"
 
     checkin = LazyOnboardHandler.calls[1]["arguments"]
     assert checkin["client_session_id"] == "agent-11111111-222"
