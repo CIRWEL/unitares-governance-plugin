@@ -96,7 +96,7 @@ SKILL_STDERR_FILE=""
 # fetch entirely (one less python spawn + server round-trip at SessionStart).
 # Codex and other hosts have no skill system; they keep the full excerpt.
 if [[ "${HOOK_HOST}" == "claude" ]]; then
-  SKILL_POINTER="Full reference available on demand: invoke the \`unitares-governance:governance-fundamentals\` skill (EISV dimensions, basins, verdicts, calibration, recovery). Read it before interpreting governance metrics; do not guess semantics."
+  SKILL_POINTER="Full reference available on demand: invoke \`unitares-governance:governance-fundamentals\` for metric semantics (EISV dimensions, basins, verdicts, calibration, recovery), or \`unitares-governance:governance-lifecycle\` for the identity ontology (onboarding, \`force_new\`, lineage via \`parent_agent_id\`, proof-owned resume). Read the relevant one before interpreting metrics or declaring lineage; do not guess semantics."
 elif [[ -f "${FETCH_SKILLS_HELPER}" ]]; then
   SKILL_STDERR_FILE=$(mktemp -t unitares-fetch-skills.XXXXXX 2>/dev/null || true)
   if [[ -n "${SKILL_STDERR_FILE}" ]]; then
@@ -588,10 +588,8 @@ not agent-authored check-ins and do not require you to echo them. Lazy
 onboarding is harness-managed attribution for this ${HOOK_HOST} process; it is not
 an agent-authored claim.
 
-Under the identity ontology, fresh process-instances mint fresh
-governance-identity. \`force_new=true\` is the default posture; lineage, when
-applicable, is declared via \`parent_agent_id\` (see hint below) rather than
-resumed via token.
+Declare \`parent_agent_id\` only for a real spawn or a handoff from an exited
+predecessor — never for co-location. Lineage is declared, not resumed via token.
 
 The post-identity hook records your UUID locally so hook-generated summaries
 can attach to the chosen identity. Hook-generated summaries are labeled as
@@ -604,8 +602,7 @@ and \`recovery_hint\` when present. Treat \`memory_suggestions\` as optional
 retrieval prompts and \`recovery_hint\` as the first recovery route when a
 tool reports degraded or paused state.
 
-If you need to recover a specific prior identity by UUID, that is an operator
-action. ${RECOVERY_GUIDANCE} Do not guess a UUID."
+${RECOVERY_GUIDANCE}"
   fi
 
   # Suppress the lineage hint on anchored sessions: it nudges force_new /
