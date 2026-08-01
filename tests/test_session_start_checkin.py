@@ -873,17 +873,37 @@ class TestScanNewestLineageFallback:
 
 
 class TestSkillInjection:
-    """Fundamentals skill content is injected on both paths (online/offline)."""
+    """Host-split Fundamentals contract: Claude Code exposes the bundled
+    skill on demand via its Skill tool, so the claude host gets a short
+    pointer instead of the 80-line excerpt (online and offline alike).
+    Hosts without a skill system (codex) keep the full excerpt."""
 
-    def test_online_context_includes_skill(self, tmp_path):
+    def test_online_claude_gets_pointer_not_excerpt(self, tmp_path):
         stdout, _ = _serve_and_run(tmp_path)
         ctx = _context(stdout)
         assert "Governance Fundamentals" in ctx
+        assert "unitares-governance:governance-fundamentals" in ctx
+        # Full-content marker from SKILL.md must NOT ship on claude
+        assert "EISV State Vector" not in ctx
 
-    def test_offline_context_includes_skill(self, tmp_path):
+    def test_offline_claude_gets_pointer_not_excerpt(self, tmp_path):
         stdout, _ = _run_hook(tmp_path, "http://127.0.0.1:1")
         ctx = _context(stdout)
         assert "Governance Fundamentals" in ctx
+        assert "unitares-governance:governance-fundamentals" in ctx
+        assert "EISV State Vector" not in ctx
+
+    def test_online_codex_keeps_full_excerpt(self, tmp_path):
+        stdout, _ = _serve_and_run(tmp_path, host="codex")
+        ctx = _context(stdout)
+        assert "Governance Fundamentals" in ctx
+        assert "EISV State Vector" in ctx
+
+    def test_offline_codex_keeps_full_excerpt(self, tmp_path):
+        stdout, _ = _run_hook(tmp_path, "http://127.0.0.1:1", host="codex")
+        ctx = _context(stdout)
+        assert "Governance Fundamentals" in ctx
+        assert "EISV State Vector" in ctx
 
 
 class TestCompactMode:
@@ -1006,8 +1026,10 @@ class TestCompactMode:
 
     def test_compact_mode_substantially_reduces_context_size(self, tmp_path):
         """The whole point of this mode — verify the compact path is
-        materially smaller. Threshold is generous (compact must be at
-        least 60% smaller) so future copy edits don't break the test."""
+        materially smaller. Per-host thresholds: claude's full path now
+        carries a skill pointer instead of the 80-line excerpt, so its
+        full prose is already lean — require >=40% reduction there. Codex
+        still ships the full excerpt, so the original >=60% bar holds."""
         workspace = tmp_path / "workspace"
         workspace.mkdir()
         slot = "claude-size-slot"
@@ -1022,6 +1044,32 @@ class TestCompactMode:
             tmp_path,
             cwd=workspace,
             claude_session_id=slot,
+            extra_env={"UNITARES_HOOK_COMPACT_TTL": "0"},
+        )
+        full_len = len(_context(full_stdout))
+
+        assert compact_len < full_len * 0.6, (
+            f"compact={compact_len}, full={full_len} — expected >=40% reduction"
+        )
+
+    def test_compact_mode_reduction_codex_keeps_strong_bar(self, tmp_path):
+        """Codex full prose still includes the excerpt — the original
+        >=60% compact reduction must keep holding there."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        slot = "codex-size-slot"
+        self._make_fresh_cache(workspace, slot)
+
+        compact_stdout, _ = _serve_and_run(
+            tmp_path, cwd=workspace, claude_session_id=slot, host="codex"
+        )
+        compact_len = len(_context(compact_stdout))
+
+        full_stdout, _ = _serve_and_run(
+            tmp_path,
+            cwd=workspace,
+            claude_session_id=slot,
+            host="codex",
             extra_env={"UNITARES_HOOK_COMPACT_TTL": "0"},
         )
         full_len = len(_context(full_stdout))
