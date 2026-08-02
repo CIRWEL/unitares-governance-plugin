@@ -35,6 +35,12 @@
             "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" session-start --host codex",
             "timeout": 15,
             "additionalContextLimit": 12000
+          },
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" runtime-start --host codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" runtime-start --host codex",
+            "timeout": 2
           }
         ]
       }
@@ -48,6 +54,12 @@
             "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" session-end --host codex",
             "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" session-end --host codex",
             "timeout": 3
+          },
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" runtime-stop --host codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" runtime-stop --host codex",
+            "timeout": 2
           }
         ]
       }

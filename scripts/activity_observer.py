@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Local Codex hook-liveness observer.
+"""Local Codex hook-liveness observer and runtime-worker trigger.
 
 ``PostToolUse`` proves only that the host delivered a completed-tool event for
 one Codex slot. It does not prove agent intent, semantic progress, EISV state,
 or even that the model is currently sampling. This helper therefore writes a
-local slot-scoped ledger and performs no network delivery.
+local slot-scoped ledger and performs no network delivery in the hook process.
 
 The ledger never stores a governance UUID, client session binding, tool input,
 or tool response. Agent-authored state remains the responsibility of
-``sync_state``. The identity-free ``/v1/substrate/observe`` endpoint is also
-intentionally not used: that sink measures never-onboarded/dark sessions, not
-liveness for an already bound process.
+``sync_state``. When enabled, the CLI starts a detached per-slot worker that
+emits bounded identity-bound runtime observations and activity rollups. The
+worker is separate so PostToolUse stays local and fast. The identity-free
+``/v1/substrate/observe`` endpoint is intentionally not used: that sink
+measures never-onboarded/dark sessions, not liveness for a bound process.
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _slot_from_stdin import slot_from_payload  # noqa: E402
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_LOCK_TIMEOUT_S = 1.0
 ACTIVITY_DIRNAME = "codex-activity"
 
@@ -73,6 +75,20 @@ def activity_state_path(home: Path, slot: str) -> Path:
     safe_slot = slot_from_payload(json.dumps({"session_id": slot})) or "slot"
     digest = hashlib.sha256(slot.encode("utf-8")).hexdigest()[:12]
     return _activity_root(home) / f"activity-{safe_slot}-{digest}.json"
+
+
+def slot_from_activity_payload(payload_text: str) -> str | None:
+    """Resolve the raw/opaque Codex slot used by the activity ledger."""
+    try:
+        payload = json.loads(payload_text)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw_slot = payload.get("session_id")
+    if isinstance(raw_slot, str) and raw_slot.strip():
+        return raw_slot.strip()
+    return slot_from_payload(payload_text)
 
 
 def _read_state(path: Path) -> dict[str, Any]:
@@ -184,13 +200,7 @@ def record_activity(
     if event_name and event_name != "PostToolUse":
         return "skip_wrong_event"
 
-    raw_slot = payload.get("session_id")
-    if isinstance(raw_slot, str) and raw_slot.strip():
-        slot = raw_slot.strip()
-    else:
-        # Codex may expose only a conversation/transcript anchor on some
-        # events. The shared helper hashes those values into an opaque slot.
-        slot = slot_from_payload(payload_text)
+    slot = slot_from_activity_payload(payload_text)
     if not slot:
         return "skip_no_slot"
 
@@ -218,7 +228,7 @@ def record_activity(
                     "source": "codex_post_tool_use_hook",
                     "evidence_source": "hook_derived",
                     "measurement_scope": "host_event_receipt",
-                    "network_emission": "none",
+                    "network_emission": state.get("network_emission", "none"),
                     "slot": slot,
                     "first_activity_at": first_at,
                     "first_activity_at_iso": _iso(first_at),
@@ -236,11 +246,28 @@ def record_activity(
 def _cli() -> int:
     parser = argparse.ArgumentParser(description="Record hook-derived Codex activity")
     parser.add_argument("--payload", default=None)
+    parser.add_argument("--workspace", default=os.getcwd())
+    parser.add_argument("--host-pid", type=int, default=0)
     args = parser.parse_args()
     payload = args.payload
     if payload is None and not sys.stdin.isatty():
         payload = sys.stdin.read()
-    print(record_activity(payload or ""))
+    payload = payload or ""
+    result = record_activity(payload)
+    if result == "recorded" and args.host_pid > 0:
+        try:
+            from runtime_observer import ensure_runtime_worker
+
+            ensure_runtime_worker(
+                payload,
+                workspace=Path(args.workspace),
+                host_pid=args.host_pid,
+            )
+        except Exception:
+            # The liveness worker is best-effort. A scheduler failure must not
+            # make a successful PostToolUse hook visible to the host.
+            pass
+    print(result)
     return 0
 
 

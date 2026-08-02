@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # UNITARES Governance Plugin — Codex PostToolUse activity sensor
 #
-# Records a completed-tool receipt under the raw Codex slot. This hook is local
-# only: it never emits an agent check-in, writes to the dark-session floor, or
-# assigns EISV, progress, or intent.
+# Records a completed-tool receipt under the raw Codex slot and ensures the
+# detached per-slot runtime worker is running. The synchronous hook remains
+# local-only; network delivery happens outside the Codex hook timeout.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -28,5 +28,5 @@ if [[ ! -f "${OBSERVER}" || -t 0 ]]; then
   exit 0
 fi
 
-python3 "${OBSERVER}" >/dev/null 2>&1 || true
+python3 "${OBSERVER}" --workspace "${PWD}" --host-pid "${PPID}" >/dev/null 2>&1 || true
 exit 0

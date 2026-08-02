@@ -100,7 +100,11 @@ def test_activity_paths_do_not_collide_after_slot_sanitization(tmp_path):
 
 
 def test_shell_hook_records_codex_payload_without_user_visible_output(tmp_path):
-    env = {**os.environ, "HOME": str(tmp_path)}
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "UNITARES_CODEX_RUNTIME_OBSERVATIONS": "off",
+    }
     result = subprocess.run(
         [str(HOOK), "--host", "codex"],
         input=_payload(slot="shell-slot"),
@@ -124,7 +128,11 @@ def test_shell_hook_is_codex_only(tmp_path):
         text=True,
         capture_output=True,
         cwd=tmp_path,
-        env={**os.environ, "HOME": str(tmp_path)},
+        env={
+            **os.environ,
+            "HOME": str(tmp_path),
+            "UNITARES_CODEX_RUNTIME_OBSERVATIONS": "off",
+        },
         timeout=5,
     )
     assert result.returncode == 0
