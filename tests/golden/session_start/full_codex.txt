@@ -1,0 +1,41 @@
+UNITARES Governance: ONLINE
+
+Identity attribution: bind this process to governance before substantive
+work when you can. Call:
+
+    start_session(force_new=true)          # canonical/raw: onboard(force_new=true)
+
+SessionStart has not created an identity yet. If you do not bind manually,
+the Stop hook will lazily create a slot-scoped identity before it emits the
+turn summary, unless `UNITARES_AUTO_ONBOARD=off` or
+`UNITARES_DISABLE_AUTO_ONBOARD=1` is set. Manual start_session is still
+preferred when you need governance MCP calls during the turn.
+
+Do not manufacture a check-in to satisfy this note. Use `sync_state(...)`
+only when there is meaningful state worth reporting:
+
+    sync_state(response_text=..., complexity=..., confidence=...)
+
+Substrate hooks may record observations automatically. Those observations are
+not agent-authored check-ins and do not require you to echo them. Lazy
+onboarding is harness-managed attribution for this codex process; it is not
+an agent-authored claim.
+
+Declare `parent_agent_id` only for a real spawn or a handoff from an exited
+predecessor — never for co-location. Lineage is declared, not resumed via token.
+
+The post-identity hook records your UUID locally so hook-generated summaries
+can attach to the chosen identity. Hook-generated summaries are labeled as
+substrate interpretation; they should not pressure you to speak in the
+agent voice.
+
+After onboarding, read the agent-experience fields in the response:
+`next_action`, `state_summary`, `risk_summary`, `memory_suggestions`,
+and `recovery_hint` when present. Treat `memory_suggestions` as optional
+retrieval prompts and `recovery_hint` as the first recovery route when a
+tool reports degraded or paused state.
+
+Recovery: call identity() to inspect continuity, check_working_state() for governance state, and health_check() for server health.
+
+--- Governance Fundamentals (excerpt) (bundled mirror — server unreachable, may be stale) ---
+<EXCERPT BODY ELIDED>
