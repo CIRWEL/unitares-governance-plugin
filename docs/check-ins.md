@@ -24,16 +24,16 @@ were the same measurement:
 | Explicit `sync_state` | agent | identity-bound check-in (`agent_report` default) | agent-authored proprioceptive state |
 | `turn_stop` | Stop hook | identity-bound check-in (`substrate_interpretation`) | host interpretation of the completed turn |
 | PostToolUse activity | PostToolUse hook | local `~/.unitares/codex-activity/` ledger | completed-tool events received for one Codex slot |
-| Bounded activity rollup | detached per-slot worker | runtime audit observation plus identity-bound check-in (`substrate_interpretation`) | a counter/time-window summary of completed-tool receipts |
+| Bounded activity rollup | detached per-slot worker | identity-bound `audit.events` runtime observation | a counter/time-window summary of completed-tool receipts |
 | Runtime heartbeat | detached per-slot worker | identity-bound `audit.events` runtime observation | only that the bound Codex host process is still alive |
 
 The local activity observer is on by default. Its synchronous PostToolUse hook
 does no network I/O: it updates the ledger, ensures one detached worker exists
 for the slot, and returns. The worker emits an activity rollup after 25
 completed tools or 30 active minutes, no more often than every 10 minutes. The
-rollup text explicitly denies semantic progress/EISV inference and is labeled
-`substrate_interpretation`. It also writes the factual counter window to the
-dedicated runtime audit sink.
+rollup writes only its factual counter window to the dedicated runtime audit
+sink. It never calls `process_agent_update`, increments governance check-in
+counts, or writes EISV.
 
 While the Codex host process remains alive, the same worker posts a heartbeat
 every 30 minutes. Heartbeats never call `process_agent_update`, never increment
@@ -42,8 +42,10 @@ tool visible as runtime liveness without pretending the agent reported state.
 Each heartbeat includes the age of the last completed-tool receipt, so a live
 but idle host remains distinguishable from recent tool activity. The worker is
 per-slot, PID-start guarded, detached from hook latency, uses a neutral home
-working directory, and stops at SessionEnd or automatically when the host PID
-exits.
+working directory, polls no more than once every five minutes by default, and
+stops at SessionEnd or automatically when the host PID exits. The synchronous
+PostToolUse path uses a cached worker-token verification window instead of
+spawning `ps` for every completed tool.
 
 Neither signal writes to `/v1/substrate/observe`; that endpoint remains the
 coverage-gap floor for sessions that never onboarded. Disable the whole bridge
@@ -78,8 +80,9 @@ TTL expires.
 ## Kill switch
 
 `UNITARES_CHECKINS=off` in the environment suppresses every plugin-emitted
-check-in and identity-free substrate observation. Disable a single trigger by
-removing its entry from `hooks/hooks.json` or `hooks/codex-hooks.json`.
+check-in, identity-free substrate observation, and identity-bound runtime
+observation. Disable a single trigger by removing its entry from
+`hooks/hooks.json` or `hooks/codex-hooks.json`.
 
 ## Diagnosing check-in behavior
 

@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""Bounded Codex runtime observation and activity-rollup scheduler.
+"""Bounded, audit-only Codex runtime observation scheduler.
 
 One detached worker is kept per Codex slot while the host process is alive.
-The worker has two deliberately different outputs:
-
-* ``heartbeat`` and ``activity_rollup`` runtime observations go to
-  ``/v1/runtime/observe`` and are stored as identity-bound audit evidence.
-* a bounded activity rollup may also call ``process_agent_update`` with
-  ``epistemic_class=substrate_interpretation``.
-
-Neither path claims semantic progress. Heartbeats never create EISV state.
+Both ``heartbeat`` and ``activity_rollup`` observations go only to
+``/v1/runtime/observe`` and are stored as identity-bound audit evidence.
+Neither path calls ``process_agent_update`` or creates EISV state.
 """
 
 from __future__ import annotations
@@ -41,17 +36,17 @@ from activity_observer import (  # noqa: E402
     activity_state_path,
     slot_from_activity_payload,
 )
-from checkin import _plugin_version, submit_checkin  # noqa: E402
+from checkin import _plugin_version  # noqa: E402
 
 
 DEFAULT_SERVER_URL = "http://localhost:8767"
-DEFAULT_POLL_S = 30.0
+DEFAULT_POLL_S = 300.0
+DEFAULT_TOKEN_RECHECK_S = 300.0
 DEFAULT_HEARTBEAT_S = 1800.0
 DEFAULT_ROLLUP_S = 1800.0
 DEFAULT_ROLLUP_TOOLS = 25
 DEFAULT_COOLDOWN_S = 600.0
 DEFAULT_HTTP_TIMEOUT_S = 5.0
-DEFAULT_CHECKIN_TIMEOUT_S = 8.0
 _EVENT_NAMESPACE = uuid.UUID("63a3c5f5-e15e-4ac8-ae3a-8adf3cfecc91")
 
 
@@ -252,7 +247,7 @@ def observation_cycle(
     slot: str,
     now: float | None = None,
     runtime_sender: Callable[[str, dict[str, Any]], bool] | None = None,
-    checkin_sender: Callable[..., str] | None = None,
+    expected_worker_pid: int | None = None,
 ) -> dict[str, str]:
     """Execute one bounded worker cycle; exposed for deterministic tests."""
     timestamp = time.time() if now is None else float(now)
@@ -268,17 +263,21 @@ def observation_cycle(
             ),
         )
     )
-    checkin_sender = checkin_sender or submit_checkin
-
     with _state_lock(state_path, timeout_s=_lock_timeout_s()):
         state = _read_state(state_path)
-    session = _load_session(workspace, slot)
-    if not session:
-        return {"status": "waiting_identity"}
+    if expected_worker_pid is not None and (
+        int(state.get("worker_pid") or 0) != expected_worker_pid
+        or state.get("stop_requested_at")
+    ):
+        return {"status": "stopped"}
 
     rollup_due, heartbeat_due = due_actions(state, now=timestamp)
     if not rollup_due and not heartbeat_due:
         return {"status": "idle"}
+
+    session = _load_session(workspace, slot)
+    if not session:
+        return {"status": "waiting_identity"}
 
     server_url = str(
         session.get("server_url")
@@ -345,42 +344,17 @@ def observation_cycle(
         )
         runtime_ok = runtime_sender(server_url, runtime_payload)
         outcomes["activity_observation"] = "sent" if runtime_ok else "failed"
-
-        minutes = max(1, round(window_seconds / 60.0))
-        response_text = (
-            "Host-derived Codex activity rollup: "
-            f"{tool_delta} completed-tool receipts over about {minutes} minutes "
-            f"({tool_count} total). No semantic progress, intent, or EISV is inferred."
-        )
-        checkin_status = checkin_sender(
-            event="codex_activity_rollup",
-            response_text=response_text,
-            complexity=0.3,
-            confidence=0.95,
-            client_session_id=session["client_session_id"],
-            slot=slot,
-            uuid=session["uuid"],
-            server_url=server_url,
-            epistemic_class="substrate_interpretation",
-            timeout=_bounded_float(
-                "UNITARES_CODEX_ROLLUP_CHECKIN_TIMEOUT_S",
-                DEFAULT_CHECKIN_TIMEOUT_S,
-                0.5,
-                15.0,
-            ),
-        )
-        outcomes["activity_checkin"] = checkin_status
         with _state_lock(state_path, timeout_s=_lock_timeout_s()):
             current = _read_state(state_path)
             current["last_rollup_attempt_at"] = timestamp
             current["last_activity_observation_status"] = outcomes[
                 "activity_observation"
             ]
-            if checkin_status == "sent":
+            if runtime_ok:
                 current["last_rollup_at"] = timestamp
                 current["last_rollup_at_iso"] = _iso(timestamp)
                 current["last_rollup_count"] = tool_count
-                current["network_emission"] = "bounded_activity_rollup"
+                current["network_emission"] = "identity_bound_runtime_observation"
             _write_state(state_path, current)
 
     outcomes.setdefault("status", "processed")
@@ -421,15 +395,27 @@ def ensure_runtime_worker(
     if not slot or host_pid <= 0 or not _process_alive(host_pid):
         return "skip_missing_host"
     state_path = activity_state_path(home or Path.home(), slot)
-    host_token = _process_start_token(host_pid)
     now = time.time()
 
     with _state_lock(state_path, timeout_s=_lock_timeout_s()):
         state = _read_state(state_path)
         worker_pid = int(state.get("worker_pid") or 0)
         worker_token = str(state.get("worker_start_token") or "")
-        if _process_alive(worker_pid, worker_token):
-            return "already_running"
+        if _process_alive(worker_pid):
+            last_verified = float(state.get("worker_token_verified_at") or 0.0)
+            token_recheck_s = _bounded_float(
+                "UNITARES_CODEX_RUNTIME_TOKEN_RECHECK_S",
+                DEFAULT_TOKEN_RECHECK_S,
+                30.0,
+                3600.0,
+            )
+            if not worker_token or now - last_verified < token_recheck_s:
+                return "already_running"
+            if _process_alive(worker_pid, worker_token):
+                state["worker_token_verified_at"] = now
+                _write_state(state_path, state)
+                return "already_running"
+        host_token = _process_start_token(host_pid)
         state.update(
             {
                 "schema_version": 2,
@@ -470,6 +456,7 @@ def ensure_runtime_worker(
         )
         state["worker_pid"] = worker.pid
         state["worker_start_token"] = _process_start_token(worker.pid)
+        state["worker_token_verified_at"] = now
         _write_state(state_path, state)
     return "started"
 
@@ -510,24 +497,21 @@ def run_worker(
     host_token: str,
 ) -> int:
     poll_s = _bounded_float(
-        "UNITARES_CODEX_RUNTIME_POLL_S", DEFAULT_POLL_S, 1.0, 300.0
+        "UNITARES_CODEX_RUNTIME_POLL_S", DEFAULT_POLL_S, 5.0, 300.0
     )
     worker_pid = os.getpid()
     while runtime_enabled() and _process_alive(host_pid, host_token):
-        with _state_lock(state_path, timeout_s=_lock_timeout_s()):
-            state = _read_state(state_path)
-        if int(state.get("worker_pid") or 0) != worker_pid:
-            break
-        if state.get("stop_requested_at"):
-            break
         try:
-            observation_cycle(
+            result = observation_cycle(
                 state_path,
                 workspace=workspace,
                 slot=slot,
+                expected_worker_pid=worker_pid,
             )
         except Exception:
-            pass
+            result = {"status": "failed"}
+        if result.get("status") == "stopped":
+            break
         time.sleep(poll_s)
     return 0
 

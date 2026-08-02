@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,20 +58,15 @@ def _seed_activity(home: Path, count: int = 25) -> Path:
     return path
 
 
-def test_activity_rollup_is_bounded_and_labeled(monkeypatch, tmp_path):
+def test_activity_rollup_is_bounded_audit_only(monkeypatch, tmp_path):
     monkeypatch.setenv("UNITARES_CODEX_ROLLUP_TOOLS", "25")
     _seed_session(tmp_path)
     state_path = _seed_activity(tmp_path)
     runtime_calls = []
-    checkins = []
 
     def runtime_sender(url, payload):
         runtime_calls.append((url, payload))
         return True
-
-    def checkin_sender(**kwargs):
-        checkins.append(kwargs)
-        return "sent"
 
     result = runtime_observer.observation_cycle(
         state_path,
@@ -80,22 +74,16 @@ def test_activity_rollup_is_bounded_and_labeled(monkeypatch, tmp_path):
         slot=SLOT,
         now=700.0,
         runtime_sender=runtime_sender,
-        checkin_sender=checkin_sender,
     )
 
     assert result["activity_observation"] == "sent"
-    assert result["activity_checkin"] == "sent"
+    assert "activity_checkin" not in result
     assert len(runtime_calls) == 1
     runtime_payload = runtime_calls[0][1]
     assert runtime_payload["observation_kind"] == "activity_rollup"
     assert runtime_payload["tool_delta"] == 25
     assert "host_process_alive" not in runtime_payload
-    assert len(checkins) == 1
-    assert checkins[0]["event"] == "codex_activity_rollup"
-    assert checkins[0]["epistemic_class"] == "substrate_interpretation"
-    assert "No semantic progress, intent, or EISV is inferred" in checkins[0][
-        "response_text"
-    ]
+    assert "response_text" not in runtime_payload
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["last_rollup_count"] == 25
@@ -105,18 +93,33 @@ def test_activity_rollup_is_bounded_and_labeled(monkeypatch, tmp_path):
         slot=SLOT,
         now=701.0,
         runtime_sender=runtime_sender,
-        checkin_sender=checkin_sender,
     )
     assert second == {"status": "idle"}
-    assert len(checkins) == 1
 
 
-def test_heartbeat_never_creates_checkin(monkeypatch, tmp_path):
+def test_failed_activity_observation_remains_pending(monkeypatch, tmp_path):
+    monkeypatch.setenv("UNITARES_CODEX_ROLLUP_TOOLS", "25")
+    _seed_session(tmp_path)
+    state_path = _seed_activity(tmp_path)
+
+    assert runtime_observer.observation_cycle(
+        state_path,
+        workspace=tmp_path,
+        slot=SLOT,
+        now=700.0,
+        runtime_sender=lambda url, payload: False,
+    )["activity_observation"] == "failed"
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state.get("last_rollup_count", 0) == 0
+    assert state["last_rollup_attempt_at"] == 700.0
+
+
+def test_heartbeat_is_audit_only(monkeypatch, tmp_path):
     monkeypatch.setenv("UNITARES_CODEX_HEARTBEAT_SECS", "300")
     _seed_session(tmp_path)
     state_path = _seed_activity(tmp_path, count=1)
     runtime_calls = []
-    checkins = []
 
     result = runtime_observer.observation_cycle(
         state_path,
@@ -124,15 +127,44 @@ def test_heartbeat_never_creates_checkin(monkeypatch, tmp_path):
         slot=SLOT,
         now=400.0,
         runtime_sender=lambda url, payload: runtime_calls.append(payload) or True,
-        checkin_sender=lambda **kwargs: checkins.append(kwargs) or "sent",
     )
 
     assert result == {"heartbeat": "sent", "status": "processed"}
-    assert checkins == []
     assert runtime_calls[0]["observation_kind"] == "heartbeat"
     assert runtime_calls[0]["host_process_alive"] is True
     assert runtime_calls[0]["seconds_since_last_tool"] == 300.0
     assert "response_text" not in runtime_calls[0]
+
+
+def test_idle_cycle_does_not_load_identity(monkeypatch, tmp_path):
+    state_path = _seed_activity(tmp_path, count=1)
+    monkeypatch.setattr(
+        runtime_observer,
+        "_load_session",
+        lambda workspace, slot: (_ for _ in ()).throw(AssertionError("loaded")),
+    )
+
+    assert runtime_observer.observation_cycle(
+        state_path,
+        workspace=tmp_path,
+        slot=SLOT,
+        now=101.0,
+    ) == {"status": "idle"}
+
+
+def test_worker_cycle_stops_when_pid_is_superseded(tmp_path):
+    state_path = _seed_activity(tmp_path, count=1)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["worker_pid"] = 222
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    assert runtime_observer.observation_cycle(
+        state_path,
+        workspace=tmp_path,
+        slot=SLOT,
+        now=101.0,
+        expected_worker_pid=333,
+    ) == {"status": "stopped"}
 
 
 def test_worker_waits_for_identity_without_network(tmp_path):
@@ -239,3 +271,48 @@ def test_worker_start_is_singleton_and_stop_is_pid_guarded(monkeypatch, tmp_path
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert "worker_pid" not in state
     assert state["stop_requested_at"] == 500.0
+
+
+def test_worker_singleton_uses_bounded_token_rechecks(monkeypatch, tmp_path):
+    monkeypatch.setenv("UNITARES_CODEX_RUNTIME_OBSERVATIONS", "on")
+    monkeypatch.setenv("UNITARES_CHECKINS", "on")
+    checks = []
+    token_reads = []
+    now = 1_000.0
+
+    monkeypatch.setattr(runtime_observer.time, "time", lambda: now)
+    monkeypatch.setattr(
+        runtime_observer,
+        "_process_alive",
+        lambda pid, token="": checks.append((pid, token)) or pid in {111, 222},
+    )
+    monkeypatch.setattr(
+        runtime_observer,
+        "_process_start_token",
+        lambda pid: token_reads.append(pid) or (f"token-{pid}" if pid else ""),
+    )
+
+    class Popen:
+        def __init__(self, *args, **kwargs):
+            self.pid = 222
+
+    monkeypatch.setattr(runtime_observer.subprocess, "Popen", Popen)
+
+    assert runtime_observer.ensure_runtime_worker(
+        _payload(), workspace=tmp_path, host_pid=111, home=tmp_path
+    ) == "started"
+    checks.clear()
+    token_reads.clear()
+    assert runtime_observer.ensure_runtime_worker(
+        _payload(), workspace=tmp_path, host_pid=111, home=tmp_path
+    ) == "already_running"
+    assert (222, "token-222") not in checks
+    assert token_reads == []
+
+    now += runtime_observer.DEFAULT_TOKEN_RECHECK_S
+    checks.clear()
+    assert runtime_observer.ensure_runtime_worker(
+        _payload(), workspace=tmp_path, host_pid=111, home=tmp_path
+    ) == "already_running"
+    assert (222, "token-222") in checks
+    assert token_reads == []
