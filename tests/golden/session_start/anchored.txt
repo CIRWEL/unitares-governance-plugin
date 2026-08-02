@@ -1,0 +1,11 @@
+UNITARES Governance: ONLINE (anchored session)
+This conversation carries a stable governance resume anchor, so your identity
+resumes automatically across turns — ONE identity per conversation, not a fresh
+one per turn. Do NOT call `start_session(force_new=true)`: force_new mints a
+new identity and breaks that continuity. If a turn needs governance MCP calls,
+the lazy onboarding at turn stop binds the resumed identity — rely on it rather
+than minting. Declare `parent_agent_id` only for a real spawn/handoff, never
+for the turn-to-turn flow of this conversation.
+Use `sync_state(...)` only for meaningful state worth reporting; do not
+manufacture a check-in to satisfy this note.
+Recovery: run /diagnose.
