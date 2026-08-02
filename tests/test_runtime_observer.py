@@ -48,9 +48,10 @@ def _seed_session(workspace: Path) -> None:
 
 def _seed_activity(home: Path, count: int = 25) -> Path:
     for offset in range(count):
-        assert activity_observer.record_activity(
-            _payload(), home=home, now=100.0 + offset
-        ) == "recorded"
+        assert (
+            activity_observer.record_activity(_payload(), home=home, now=100.0 + offset)
+            == "recorded"
+        )
     path = activity_observer.activity_state_path(home, SLOT)
     state = json.loads(path.read_text(encoding="utf-8"))
     state["worker_started_at"] = 100.0
@@ -82,6 +83,9 @@ def test_activity_rollup_is_bounded_audit_only(monkeypatch, tmp_path):
     runtime_payload = runtime_calls[0][1]
     assert runtime_payload["observation_kind"] == "activity_rollup"
     assert runtime_payload["tool_delta"] == 25
+    assert runtime_payload["execution_mode"] == "unknown"
+    assert runtime_payload["execution_mode_source"] == "unspecified"
+    assert runtime_payload["model"] == ""
     assert "host_process_alive" not in runtime_payload
     assert "response_text" not in runtime_payload
 
@@ -97,18 +101,50 @@ def test_activity_rollup_is_bounded_audit_only(monkeypatch, tmp_path):
     assert second == {"status": "idle"}
 
 
+def test_activity_rollup_preserves_explicit_execution_provenance(monkeypatch, tmp_path):
+    monkeypatch.setenv("UNITARES_CODEX_ROLLUP_TOOLS", "25")
+    _seed_session(tmp_path)
+    state_path = _seed_activity(tmp_path)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.update(
+        {
+            "execution_mode": "automation",
+            "execution_mode_source": "explicit_env",
+            "model": "gpt-5.4",
+        }
+    )
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    runtime_calls = []
+
+    result = runtime_observer.observation_cycle(
+        state_path,
+        workspace=tmp_path,
+        slot=SLOT,
+        now=700.0,
+        runtime_sender=lambda url, payload: runtime_calls.append(payload) or True,
+    )
+
+    assert result["activity_observation"] == "sent"
+    assert runtime_calls[0]["execution_mode"] == "automation"
+    assert runtime_calls[0]["execution_mode_source"] == "explicit_env"
+    assert runtime_calls[0]["model"] == "gpt-5.4"
+
+
 def test_failed_activity_observation_remains_pending(monkeypatch, tmp_path):
     monkeypatch.setenv("UNITARES_CODEX_ROLLUP_TOOLS", "25")
     _seed_session(tmp_path)
     state_path = _seed_activity(tmp_path)
 
-    assert runtime_observer.observation_cycle(
-        state_path,
-        workspace=tmp_path,
-        slot=SLOT,
-        now=700.0,
-        runtime_sender=lambda url, payload: False,
-    )["activity_observation"] == "failed"
+    assert (
+        runtime_observer.observation_cycle(
+            state_path,
+            workspace=tmp_path,
+            slot=SLOT,
+            now=700.0,
+            runtime_sender=lambda url, payload: False,
+        )["activity_observation"]
+        == "failed"
+    )
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state.get("last_rollup_count", 0) == 0
@@ -134,6 +170,45 @@ def test_heartbeat_is_audit_only(monkeypatch, tmp_path):
     assert runtime_calls[0]["host_process_alive"] is True
     assert runtime_calls[0]["seconds_since_last_tool"] == 300.0
     assert "response_text" not in runtime_calls[0]
+
+
+def test_execution_context_is_explicit_and_model_is_descriptive(monkeypatch):
+    payload = json.dumps(
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": SLOT,
+            "model": "gpt-5.4",
+            "permission_mode": "bypassPermissions",
+        }
+    )
+    assert runtime_observer._execution_context(payload) == (
+        "unknown",
+        "unspecified",
+        "gpt-5.4",
+    )
+
+    monkeypatch.setenv("UNITARES_CODEX_EXECUTION_MODE", "automation")
+    assert runtime_observer._execution_context(payload) == (
+        "automation",
+        "explicit_env",
+        "gpt-5.4",
+    )
+
+
+def test_future_explicit_hook_mode_is_preserved(monkeypatch):
+    monkeypatch.delenv("UNITARES_CODEX_EXECUTION_MODE", raising=False)
+    payload = json.dumps(
+        {
+            "hook_event_name": "SessionStart",
+            "execution_mode": "ephemeral",
+            "model": "gpt-5.6-terra",
+        }
+    )
+    assert runtime_observer._execution_context(payload) == (
+        "ephemeral",
+        "hook_payload",
+        "gpt-5.6-terra",
+    )
 
 
 def test_idle_cycle_does_not_load_identity(monkeypatch, tmp_path):
@@ -257,20 +332,29 @@ def test_worker_start_is_singleton_and_stop_is_pid_guarded(monkeypatch, tmp_path
         lambda pid, sig: kills.append((pid, sig)) or alive.discard(pid),
     )
 
-    assert runtime_observer.ensure_runtime_worker(
-        _payload(), workspace=tmp_path, host_pid=111, home=tmp_path
-    ) == "started"
-    assert runtime_observer.ensure_runtime_worker(
-        _payload(), workspace=tmp_path, host_pid=111, home=tmp_path
-    ) == "already_running"
-    assert runtime_observer.stop_runtime_worker(
-        _payload(), home=tmp_path, now=500.0
-    ) == "stopped"
+    assert (
+        runtime_observer.ensure_runtime_worker(
+            _payload(), workspace=tmp_path, host_pid=111, home=tmp_path
+        )
+        == "started"
+    )
+    assert (
+        runtime_observer.ensure_runtime_worker(
+            _payload(), workspace=tmp_path, host_pid=111, home=tmp_path
+        )
+        == "already_running"
+    )
+    assert (
+        runtime_observer.stop_runtime_worker(_payload(), home=tmp_path, now=500.0)
+        == "stopped"
+    )
     assert kills and kills[0][0] == 222
     state_path = activity_observer.activity_state_path(tmp_path, SLOT)
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert "worker_pid" not in state
     assert state["stop_requested_at"] == 500.0
+    assert state["execution_mode"] == "unknown"
+    assert state["execution_mode_source"] == "unspecified"
 
 
 def test_worker_singleton_uses_bounded_token_rechecks(monkeypatch, tmp_path):
@@ -298,21 +382,30 @@ def test_worker_singleton_uses_bounded_token_rechecks(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runtime_observer.subprocess, "Popen", Popen)
 
-    assert runtime_observer.ensure_runtime_worker(
-        _payload(), workspace=tmp_path, host_pid=111, home=tmp_path
-    ) == "started"
+    assert (
+        runtime_observer.ensure_runtime_worker(
+            _payload(), workspace=tmp_path, host_pid=111, home=tmp_path
+        )
+        == "started"
+    )
     checks.clear()
     token_reads.clear()
-    assert runtime_observer.ensure_runtime_worker(
-        _payload(), workspace=tmp_path, host_pid=111, home=tmp_path
-    ) == "already_running"
+    assert (
+        runtime_observer.ensure_runtime_worker(
+            _payload(), workspace=tmp_path, host_pid=111, home=tmp_path
+        )
+        == "already_running"
+    )
     assert (222, "token-222") not in checks
     assert token_reads == []
 
     now += runtime_observer.DEFAULT_TOKEN_RECHECK_S
     checks.clear()
-    assert runtime_observer.ensure_runtime_worker(
-        _payload(), workspace=tmp_path, host_pid=111, home=tmp_path
-    ) == "already_running"
+    assert (
+        runtime_observer.ensure_runtime_worker(
+            _payload(), workspace=tmp_path, host_pid=111, home=tmp_path
+        )
+        == "already_running"
+    )
     assert (222, "token-222") in checks
     assert token_reads == []

@@ -47,6 +47,7 @@ DEFAULT_ROLLUP_S = 1800.0
 DEFAULT_ROLLUP_TOOLS = 25
 DEFAULT_COOLDOWN_S = 600.0
 DEFAULT_HTTP_TIMEOUT_S = 5.0
+EXECUTION_MODES = {"interactive", "automation", "ephemeral", "unknown"}
 _EVENT_NAMESPACE = uuid.UUID("63a3c5f5-e15e-4ac8-ae3a-8adf3cfecc91")
 
 
@@ -75,9 +76,7 @@ def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
 def runtime_enabled() -> bool:
     return (
         _truthy(os.environ.get("UNITARES_CODEX_LIVENESS"), default=True)
-        and _truthy(
-            os.environ.get("UNITARES_CODEX_RUNTIME_OBSERVATIONS"), default=True
-        )
+        and _truthy(os.environ.get("UNITARES_CODEX_RUNTIME_OBSERVATIONS"), default=True)
         and os.environ.get("UNITARES_CHECKINS", "on").strip().lower() != "off"
     )
 
@@ -88,6 +87,29 @@ def _iso(epoch: float) -> str:
 
 def _slot_hash(slot: str) -> str:
     return hashlib.sha256(slot.encode("utf-8")).hexdigest()[:32]
+
+
+def _execution_context(payload_text: str) -> tuple[str, str, str]:
+    """Return mode, provenance source, and model without guessing from names."""
+    try:
+        payload = json.loads(payload_text) if payload_text else {}
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    explicit = (
+        str(os.environ.get("UNITARES_CODEX_EXECUTION_MODE") or "").strip().lower()
+    )
+    if explicit in EXECUTION_MODES - {"unknown"}:
+        mode, source = explicit, "explicit_env"
+    else:
+        hook_mode = str(payload.get("execution_mode") or "").strip().lower()
+        if hook_mode in EXECUTION_MODES - {"unknown"}:
+            mode, source = hook_mode, "hook_payload"
+        else:
+            mode, source = "unknown", "unspecified"
+    return mode, source, str(payload.get("model") or "").strip()[:80]
 
 
 def _process_start_token(pid: int) -> str:
@@ -184,12 +206,18 @@ def _runtime_payload(
     tool_delta: int,
     window_seconds: float,
     seconds_since_last_tool: float | None,
+    execution_mode: str = "unknown",
+    execution_mode_source: str = "unspecified",
+    model: str = "",
 ) -> dict[str, Any]:
     payload = {
         "agent_uuid": session["uuid"],
         "client_session_id": session["client_session_id"],
         "observation_kind": kind,
         "host_family": "codex",
+        "execution_mode": execution_mode,
+        "execution_mode_source": execution_mode_source,
+        "model": model[:80],
         "slot_hash": _slot_hash(slot),
         "observed_at": observed_at,
         "tool_count": max(0, tool_count),
@@ -285,6 +313,9 @@ def observation_cycle(
         or DEFAULT_SERVER_URL
     )
     tool_count = max(0, int(state.get("tool_count") or 0))
+    execution_mode = str(state.get("execution_mode") or "unknown")
+    execution_mode_source = str(state.get("execution_mode_source") or "unspecified")
+    model = str(state.get("model") or "")
     outcomes: dict[str, str] = {}
 
     if heartbeat_due:
@@ -310,6 +341,9 @@ def observation_cycle(
             tool_delta=0,
             window_seconds=interval,
             seconds_since_last_tool=seconds_since_last_tool,
+            execution_mode=execution_mode,
+            execution_mode_source=execution_mode_source,
+            model=model,
         )
         ok = runtime_sender(server_url, payload)
         outcomes["heartbeat"] = "sent" if ok else "failed"
@@ -341,6 +375,9 @@ def observation_cycle(
             seconds_since_last_tool=max(
                 0.0, timestamp - float(state.get("last_activity_at") or timestamp)
             ),
+            execution_mode=execution_mode,
+            execution_mode_source=execution_mode_source,
+            model=model,
         )
         runtime_ok = runtime_sender(server_url, runtime_payload)
         outcomes["activity_observation"] = "sent" if runtime_ok else "failed"
@@ -396,6 +433,7 @@ def ensure_runtime_worker(
         return "skip_missing_host"
     state_path = activity_state_path(home or Path.home(), slot)
     now = time.time()
+    execution_mode, execution_mode_source, model = _execution_context(payload_text)
 
     with _state_lock(state_path, timeout_s=_lock_timeout_s()):
         state = _read_state(state_path)
@@ -422,6 +460,9 @@ def ensure_runtime_worker(
                 "slot": slot[:256],
                 "host_pid": host_pid,
                 "host_start_token": host_token,
+                "execution_mode": execution_mode,
+                "execution_mode_source": execution_mode_source,
+                "model": model,
                 "worker_started_at": now,
                 "worker_started_at_iso": _iso(now),
             }
@@ -496,9 +537,7 @@ def run_worker(
     host_pid: int,
     host_token: str,
 ) -> int:
-    poll_s = _bounded_float(
-        "UNITARES_CODEX_RUNTIME_POLL_S", DEFAULT_POLL_S, 5.0, 300.0
-    )
+    poll_s = _bounded_float("UNITARES_CODEX_RUNTIME_POLL_S", DEFAULT_POLL_S, 5.0, 300.0)
     worker_pid = os.getpid()
     while runtime_enabled() and _process_alive(host_pid, host_token):
         try:

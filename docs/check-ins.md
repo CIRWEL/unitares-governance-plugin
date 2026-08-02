@@ -47,6 +47,16 @@ stops at SessionEnd or automatically when the host PID exits. The synchronous
 PostToolUse path uses a cached worker-token verification window instead of
 spawning `ps` for every completed tool.
 
+Runtime observations also carry the Codex model as descriptive context and an
+execution-mode pair: `execution_mode` plus `execution_mode_source`. Codex's
+documented hook payload does not currently identify scheduled tasks, and model
+names such as `gpt-5.4` are not launch-mode proof. The worker therefore emits
+`unknown` / `unspecified` unless an execution-specific environment sets
+`UNITARES_CODEX_EXECUTION_MODE=interactive|automation|ephemeral`, or a future
+hook payload provides an explicit mode. An environment classification is
+labeled `explicit_env`; a host-provided classification is labeled
+`hook_payload`.
+
 Neither signal writes to `/v1/substrate/observe`; that endpoint remains the
 coverage-gap floor for sessions that never onboarded. Disable the whole bridge
 with `UNITARES_CODEX_LIVENESS=off` or only network scheduling with
