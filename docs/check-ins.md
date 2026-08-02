@@ -24,19 +24,38 @@ were the same measurement:
 | Explicit `sync_state` | agent | identity-bound check-in (`agent_report` default) | agent-authored proprioceptive state |
 | `turn_stop` | Stop hook | identity-bound check-in (`substrate_interpretation`) | host interpretation of the completed turn |
 | PostToolUse activity | PostToolUse hook | local `~/.unitares/codex-activity/` ledger | completed-tool events received for one Codex slot |
+| Bounded activity rollup | detached per-slot worker | runtime audit observation plus identity-bound check-in (`substrate_interpretation`) | a counter/time-window summary of completed-tool receipts |
+| Runtime heartbeat | detached per-slot worker | identity-bound `audit.events` runtime observation | only that the bound Codex host process is still alive |
 
-The local activity observer is on by default. It does not synthesize a
-check-in, EISV vector, intent, or progress, and it does not write to
-`/v1/substrate/observe`: that endpoint is the coverage-gap floor for sessions
-that never onboarded. Disable local recording with
-`UNITARES_CODEX_LIVENESS=off` or tune its bounded lock wait with
-`UNITARES_CODEX_ACTIVITY_LOCK_TIMEOUT_S`.
+The local activity observer is on by default. Its synchronous PostToolUse hook
+does no network I/O: it updates the ledger, ensures one detached worker exists
+for the slot, and returns. The worker emits an activity rollup after 25
+completed tools or 30 active minutes, no more often than every 10 minutes. The
+rollup text explicitly denies semantic progress/EISV inference and is labeled
+`substrate_interpretation`. It also writes the factual counter window to the
+dedicated runtime audit sink.
+
+While the Codex host process remains alive, the same worker posts a heartbeat
+every 30 minutes. Heartbeats never call `process_agent_update`, never increment
+governance check-in counts, and never write EISV. This keeps a 12-hour blocking
+tool visible as runtime liveness without pretending the agent reported state.
+Each heartbeat includes the age of the last completed-tool receipt, so a live
+but idle host remains distinguishable from recent tool activity. The worker is
+per-slot, PID-start guarded, detached from hook latency, uses a neutral home
+working directory, and stops at SessionEnd or automatically when the host PID
+exits.
+
+Neither signal writes to `/v1/substrate/observe`; that endpoint remains the
+coverage-gap floor for sessions that never onboarded. Disable the whole bridge
+with `UNITARES_CODEX_LIVENESS=off` or only network scheduling with
+`UNITARES_CODEX_RUNTIME_OBSERVATIONS=off`. Tune the thresholds through
+`UNITARES_CODEX_ROLLUP_TOOLS`, `UNITARES_CODEX_ROLLUP_SECS`,
+`UNITARES_CODEX_ROLLUP_COOLDOWN_S`, and `UNITARES_CODEX_HEARTBEAT_SECS`.
 
 This hook path is a diagnostic bridge for the packaged Codex client. If a
-custom orchestrator owns Codex App Server or the Codex SDK, consume its native
-turn/item event stream and attribute those events as host observations. A
-dedicated host-observation sink is required before that telemetry can be
-centralized without contaminating agent trajectories or dark-session counts.
+custom orchestrator owns Codex App Server or the Codex SDK, prefer its native
+turn/item event stream and post the same identity-bound host observations to
+`/v1/runtime/observe`.
 
 Identity-bearing emissions share one helper (`scripts/checkin.py`) that:
 - Applies secret-pattern redaction to `response_text` before POST

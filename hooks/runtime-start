@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# UNITARES Governance Plugin — start the detached Codex runtime observer.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+HOOK_HOST="claude"
+if [[ "${1:-}" == "--host" && -n "${2:-}" ]]; then
+  HOOK_HOST="$2"
+fi
+if [[ "${HOOK_HOST}" != "codex" || -t 0 ]]; then
+  exit 0
+fi
+
+DEFAULTS="${PLUGIN_ROOT}/config/defaults.env"
+if [[ -f "${DEFAULTS}" ]]; then
+  # shellcheck disable=SC1090
+  source "${DEFAULTS}"
+fi
+
+python3 "${PLUGIN_ROOT}/scripts/runtime_observer.py" start \
+  --workspace "${PWD}" --host-pid "${PPID}" >/dev/null 2>&1 || true
+exit 0
