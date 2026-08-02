@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# UNITARES Governance Plugin — Codex PostToolUse activity sensor
+#
+# Records a completed-tool receipt under the raw Codex slot. This hook is local
+# only: it never emits an agent check-in, writes to the dark-session floor, or
+# assigns EISV, progress, or intent.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+HOOK_HOST="claude"
+if [[ "${1:-}" == "--host" && -n "${2:-}" ]]; then
+  HOOK_HOST="$2"
+fi
+if [[ "${HOOK_HOST}" != "codex" ]]; then
+  exit 0
+fi
+
+DEFAULTS="${PLUGIN_ROOT}/config/defaults.env"
+if [[ -f "${DEFAULTS}" ]]; then
+  # shellcheck disable=SC1090
+  source "${DEFAULTS}"
+fi
+
+OBSERVER="${PLUGIN_ROOT}/scripts/activity_observer.py"
+if [[ ! -f "${OBSERVER}" || -t 0 ]]; then
+  exit 0
+fi
+
+python3 "${OBSERVER}" >/dev/null 2>&1 || true
+exit 0

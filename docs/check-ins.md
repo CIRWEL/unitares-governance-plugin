@@ -1,6 +1,6 @@
-# Check-In Triggers
+# Check-In and Liveness Triggers
 
-The Claude adapter emits canonical `process_agent_update` calls at two trigger points.
+The adapters emit canonical `process_agent_update` calls at semantic trigger points.
 `session-start` is deliberately read-only: it checks server reachability,
 fetches the governance fundamentals excerpt, and prompts the agent to call
 `start_session(force_new=true)` / `onboard(force_new=true)` itself only when no
@@ -13,13 +13,42 @@ observation instead. Once a process is bound, later turns continue via
 | Trigger | Hook script | Frequency | `metadata.event` |
 |---|---|---|---|
 | Claude turn ends | `post-stop` | per Claude turn | `turn_stop` |
+| Codex turn ends | `post-stop` | per Codex turn | `turn_stop` |
 | Edit threshold crossed | `post-edit` | every N edits or T seconds | `auto_edit` |
 
-All emissions share one shared helper (`scripts/checkin.py`) that:
+Codex has three distinct signal classes. They should not be counted as if they
+were the same measurement:
+
+| Signal | Producer | Storage path | What it measures |
+|---|---|---|---|
+| Explicit `sync_state` | agent | identity-bound check-in (`agent_report` default) | agent-authored proprioceptive state |
+| `turn_stop` | Stop hook | identity-bound check-in (`substrate_interpretation`) | host interpretation of the completed turn |
+| PostToolUse activity | PostToolUse hook | local `~/.unitares/codex-activity/` ledger | completed-tool events received for one Codex slot |
+
+The local activity observer is on by default. It does not synthesize a
+check-in, EISV vector, intent, or progress, and it does not write to
+`/v1/substrate/observe`: that endpoint is the coverage-gap floor for sessions
+that never onboarded. Disable local recording with
+`UNITARES_CODEX_LIVENESS=off` or tune its bounded lock wait with
+`UNITARES_CODEX_ACTIVITY_LOCK_TIMEOUT_S`.
+
+This hook path is a diagnostic bridge for the packaged Codex client. If a
+custom orchestrator owns Codex App Server or the Codex SDK, consume its native
+turn/item event stream and attribute those events as host observations. A
+dedicated host-observation sink is required before that telemetry can be
+centralized without contaminating agent trajectories or dark-session counts.
+
+Identity-bearing emissions share one helper (`scripts/checkin.py`) that:
 - Applies secret-pattern redaction to `response_text` before POST
 - Truncates `response_text` to 512 chars
 - Logs one status line per attempt to `~/.unitares/checkins.log`
-- Returns fire-and-forget: never raises, never blocks a Claude turn on failure
+- Returns fire-and-forget: never raises or makes hook failure user-visible
+
+Codex identity tools may arrive at the hook boundary with either
+`mcp__unitares-governance__...` (native alias) or
+`mcp__unitares_governance__...` (code-mode-normalized alias). Both exact names
+are captured into the same slot-scoped cache, so a later Stop hook reuses the
+explicit identity instead of lazily minting a second one.
 
 `session-end` is deliberately not a third network trigger. Claude gives
 plugin-provided SessionEnd hooks a shared 1.5-second budget, so that hook only
@@ -30,8 +59,8 @@ TTL expires.
 ## Kill switch
 
 `UNITARES_CHECKINS=off` in the environment suppresses every plugin-emitted
-check-in. Disable a single trigger by removing its entry from
-`hooks/hooks.json`.
+check-in and identity-free substrate observation. Disable a single trigger by
+removing its entry from `hooks/hooks.json` or `hooks/codex-hooks.json`.
 
 ## Diagnosing check-in behavior
 
@@ -44,7 +73,10 @@ Expected line format:
 2026-04-17T02:45:12Z | slot=abc12345 | event=turn_stop | uuid=86ae619f | status=sent | latency_ms=42
 ```
 
-Statuses: `sent` (accepted by governance), `fail` (POST failed — see `err=...`), `skip_kill_switch` (suppressed by `UNITARES_CHECKINS=off`), `error` (client-side exception; caller passed garbage values).
+Statuses: `sent` (accepted by governance), `fail` (POST failed — see `err=...`),
+`floor_sent`/`floor_fail` (identity-free Stop floor observation),
+`skip_kill_switch` (suppressed by `UNITARES_CHECKINS=off`), and `error`
+(client-side exception; caller passed garbage values).
 
 ## Protective audit
 
@@ -96,8 +128,9 @@ Bearer token. Check-ins, skill fetches, onboarding, the identity sidecar, and
 identity-free floor observations forward the non-empty value in the
 `Authorization` header. The bundled Claude MCP transport expands the same value
 in its `headers` map. Current Claude hook payloads identify that plugin server as
-`plugin_unitares-governance_unitares-governance`; Codex hook payloads use the
-bare `unitares-governance` alias.
+`plugin_unitares-governance_unitares-governance`. Codex hook payloads use the
+bare `unitares-governance` alias for native calls and its normalized
+`unitares_governance` spelling for code-mode calls.
 
 The bundled Codex transport is deliberately unauthenticated localhost and has
 no `bearer_token_env_var`. For hosted or authenticated governance, disable the

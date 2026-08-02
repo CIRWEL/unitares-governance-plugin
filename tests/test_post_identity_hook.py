@@ -222,7 +222,9 @@ class TestPostIdentityRecordsResponse:
     def test_codex_start_session_envelope_writes_slotted_cache(self, tmp_path):
         hook_input = {
             "session_id": "slot-codex-alias",
-            "tool_name": "mcp__unitares-governance__start_session",
+            # Codex code mode normalizes the configured hyphenated server name
+            # to underscores in the PostToolUse envelope.
+            "tool_name": "mcp__unitares_governance__start_session",
             "tool_input": {"force_new": True},
             "tool_response": _start_session_response(uuid="u-codex-alias"),
         }

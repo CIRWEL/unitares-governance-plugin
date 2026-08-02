@@ -71,13 +71,21 @@ def test_claude_trusts_the_exact_bundled_plugin_server_alias():
     ) is None
 
 
-def test_codex_trusts_only_the_canonical_bundled_server_alias():
-    assert is_governance_tool(
-        "mcp__unitares-governance__sync_state",
-        host="codex",
-    )
+@pytest.mark.parametrize(
+    "server",
+    ["unitares-governance", "unitares_governance"],
+)
+def test_codex_trusts_exact_native_and_code_mode_server_aliases(server: str):
+    assert is_governance_tool(f"mcp__{server}__sync_state", host="codex")
+
+
+def test_codex_rejects_noncanonical_governance_aliases():
     assert not is_governance_tool("mcp__governance__sync_state", host="codex")
     assert not is_governance_tool("mcp__unitares__sync_state", host="codex")
+    assert not is_governance_tool(
+        "mcp__unitares_governance_shadow__sync_state",
+        host="codex",
+    )
     assert not is_governance_tool(
         "mcp__plugin_unitares-governance_unitares-governance__sync_state",
         host="codex",
