@@ -33,6 +33,27 @@ die() {
     exit 2
 }
 
+# Fleet flag compatibility (2026-08-01): agents carry the unitares ship.sh
+# flag vocabulary across repos. This helper's only delivery mode IS a draft
+# PR, so the draft flags are accepted as no-ops; modes it cannot honor are
+# refused loudly instead of being swallowed into the commit message (the
+# bridge repo's pre-sync script titled a PR literally "--draft-pr").
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        --draft-pr|--draft)
+            shift ;;
+        --open-pr|--pr|--auto-merge|--direct|--stage-all|--all|--plan|--dry-run|--classify)
+            die "this repo's ship.sh only delivers draft PRs; unsupported mode: $1" ;;
+        --help|-h)
+            usage
+            exit 0 ;;
+        --*)
+            die "unknown option: $1" ;;
+        *)
+            break ;;
+    esac
+done
+
 if [[ "$#" -ne 1 || -z "${1:-}" ]]; then
     usage >&2
     exit 2
