@@ -206,8 +206,11 @@ fi
 
 WORKSPACE_CACHE=""
 NUDGE_MARKER=""
+KG_RECALL_MARKER=""
 NUDGE_ALREADY_SHOWN=0
 SHOULD_WRITE_NUDGE_MARKER=0
+KG_RECALL_ALREADY_SHOWN=0
+SHOULD_WRITE_KG_RECALL_MARKER=0
 if [[ -n "${HOST_SESSION_ID}" ]]; then
   # Match session_cache.py _slot_suffix: alnum + [-_], cap at 64 chars.
   SAFE_SLOT=$(python3 - "${HOST_SESSION_ID}" <<'PY' 2>/dev/null || true
@@ -220,6 +223,7 @@ PY
   if [[ -n "${SAFE_SLOT}" ]]; then
     WORKSPACE_CACHE="${PWD}/.unitares/session-${SAFE_SLOT}.json"
     NUDGE_MARKER="${PWD}/.unitares/session-start-nudge-${SAFE_SLOT}.json"
+    KG_RECALL_MARKER="${PWD}/.unitares/session-start-kg-recall-${SAFE_SLOT}.json"
   fi
 fi
 
@@ -255,6 +259,27 @@ PY
 fi
 if [[ -n "${NUDGE_MARKER}" && ! -f "${WORKSPACE_CACHE}" && -f "${NUDGE_MARKER}" ]]; then
   NUDGE_ALREADY_SHOWN=1
+fi
+
+# SessionStart can fire repeatedly on resume/compact. Shared-memory context is
+# useful once per work interval, not once per hook event; a slot-scoped marker
+# bounds read traffic without creating governance identity or state.
+KG_RECALL_TTL_SECS="${UNITARES_HOOK_KG_RECALL_TTL_S:-3600}"
+if [[ -n "${KG_RECALL_MARKER}" && -f "${KG_RECALL_MARKER}" ]]; then
+  KG_RECALL_MARKER_MTIME=$(python3 - "${KG_RECALL_MARKER}" <<'PY' 2>/dev/null || echo 0
+import os
+import sys
+
+try:
+    print(int(os.path.getmtime(sys.argv[1])))
+except Exception:
+    print(0)
+PY
+)
+  KG_RECALL_MARKER_AGE=$(( $(date +%s) - KG_RECALL_MARKER_MTIME ))
+  if (( KG_RECALL_MARKER_MTIME > 0 && KG_RECALL_MARKER_AGE >= 0 && KG_RECALL_MARKER_AGE < KG_RECALL_TTL_SECS )); then
+    KG_RECALL_ALREADY_SHOWN=1
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -632,6 +657,49 @@ ${SKILL_POINTER}"
 fi
 
 # ---------------------------------------------------------------------------
+# Bounded shared-memory recall
+#
+# This is a read-only `knowledge(action="search")` call. It does not onboard,
+# resume, check in, or write KG state. The helper derives a conservative query
+# from repo + branch, suppresses low-confidence semantic-only results, and
+# excludes summary-only memory mirrors that lack substantive `details`.
+# Failures and timeouts are precision-or-silence: SessionStart still ships.
+# ---------------------------------------------------------------------------
+KG_RECALL_CONTEXT=""
+KG_RECALL_MODE="$(printf '%s' "${UNITARES_HOOK_KG_RECALL:-on}" | tr '[:upper:]' '[:lower:]')"
+KG_RECALL_HELPER="${PLUGIN_ROOT}/scripts/kg_recall.py"
+if [[ -n "${HEALTH_STATUS}" \
+      && "${KG_RECALL_ALREADY_SHOWN}" != "1" \
+      && "${KG_RECALL_MODE}" != "0" \
+      && "${KG_RECALL_MODE}" != "off" \
+      && "${KG_RECALL_MODE}" != "false" \
+      && "${KG_RECALL_MODE}" != "no" \
+      && -f "${KG_RECALL_HELPER}" ]]; then
+  KG_RECALL_ARGS=(
+    --workspace "${PWD}"
+    --server-url "${SERVER_URL}"
+    --limit "${UNITARES_HOOK_KG_RECALL_LIMIT:-3}"
+    --timeout "${UNITARES_HOOK_KG_RECALL_TIMEOUT_S:-2.0}"
+    --format-context
+  )
+  # A real orchestrator-provisioned anchor is safe attribution proof. A bare
+  # environment value is not; only pass it under the existing anchored gate.
+  if [[ "${ANCHOR_RESUME_ENABLED}" == "1" ]]; then
+    KG_RECALL_ARGS+=(--client-session-id "${UNITARES_CLIENT_SESSION_ID}")
+  fi
+  KG_RECALL_CONTEXT=$(python3 "${KG_RECALL_HELPER}" "${KG_RECALL_ARGS[@]}" \
+    2>>"${HEALTH_LOG}" || true)
+fi
+if [[ -n "${KG_RECALL_CONTEXT}" ]]; then
+  CONTEXT="${CONTEXT}
+
+${KG_RECALL_CONTEXT}"
+  if [[ -n "${KG_RECALL_MARKER}" ]]; then
+    SHOULD_WRITE_KG_RECALL_MARKER=1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Workspace coordination briefing (git-sourced, adoption-independent)
 #
 # The governance substrate CANNOT answer "who else is live in this workspace"
@@ -762,5 +830,9 @@ then
   if [[ "${SHOULD_WRITE_NUDGE_MARKER}" == "1" && -n "${NUDGE_MARKER}" ]]; then
     mkdir -p "$(dirname "${NUDGE_MARKER}")" 2>/dev/null || true
     printf '{"shown_at":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${NUDGE_MARKER}" 2>/dev/null || true
+  fi
+  if [[ "${SHOULD_WRITE_KG_RECALL_MARKER}" == "1" && -n "${KG_RECALL_MARKER}" ]]; then
+    mkdir -p "$(dirname "${KG_RECALL_MARKER}")" 2>/dev/null || true
+    printf '{"shown_at":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${KG_RECALL_MARKER}" 2>/dev/null || true
   fi
 fi

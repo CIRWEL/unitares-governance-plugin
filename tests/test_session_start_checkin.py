@@ -14,7 +14,8 @@ resume menu. It only:
      menu invited cross-instance hijack (KG bug 2026-04-20T00:09:51).
 
 These tests lock in the post-2026-04-20 contract:
-  - Hook emits ZERO HTTP tool calls on SessionStart.
+  - Hook emits ZERO identity-mutating or state-writing calls on SessionStart.
+  - A bounded read-only knowledge search may supply shared-memory leads.
   - Online context describes the provisional-free state.
   - Online context surfaces ONLY the workspace-local continuity cache, if any.
   - Online context never lists ~/.unitares/session-*.json contents.
@@ -149,7 +150,6 @@ class TestSessionStartMakesNoToolCalls:
         "bind_session",
         "process_agent_update",
         "self_recovery",
-        "knowledge",
         "leave_note",
         "outcome_event",
         "calibration",
@@ -161,8 +161,19 @@ class TestSessionStartMakesNoToolCalls:
     }
 
     def _assert_no_state_mutations(self, calls):
-        tool_calls = [c.get("name") for c in calls if isinstance(c, dict)]
-        forbidden = [t for t in tool_calls if t in self.FORBIDDEN_TOOLS]
+        tool_calls = []
+        forbidden = []
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            name = call.get("name")
+            if name == "knowledge":
+                action = (call.get("arguments") or {}).get("action")
+                if action != "search":
+                    forbidden.append(f"knowledge:{action}")
+                continue
+            tool_calls.append(name)
+        forbidden.extend(t for t in tool_calls if t in self.FORBIDDEN_TOOLS)
         assert not forbidden, (
             f"SessionStart must not invoke identity-mutating governance tools; "
             f"saw forbidden: {forbidden} (full call list: {tool_calls})"
@@ -172,18 +183,20 @@ class TestSessionStartMakesNoToolCalls:
         _, calls = _serve_and_run(tmp_path)
         self._assert_no_state_mutations(calls)
 
-    def test_online_path_only_fetches_skills_introspection(self, tmp_path):
-        """Positive bound: the only tool call SessionStart should make is
-        the S15-c skills fetch. Surface any new call so a future hook
-        addition is reviewed against the no-state-mutation invariant."""
+    def test_online_path_only_fetches_skills_and_shared_memory(self, tmp_path):
+        """Positive bound: SessionStart may fetch canonical skills and run one
+        read-only KG search; any other call needs explicit review."""
         _, calls = _serve_and_run(tmp_path)
         tool_calls = [c.get("name") for c in calls if isinstance(c, dict)]
-        unexpected = [t for t in tool_calls if t != "skills"]
+        unexpected = [t for t in tool_calls if t not in {"skills", "knowledge"}]
         assert not unexpected, (
             f"SessionStart made unexpected tool calls: {unexpected}. "
-            f"Only 'skills' (S15-c introspection) is allowed; any other "
+            f"Only 'skills' and read-only 'knowledge' are allowed; any other "
             f"addition needs explicit review."
         )
+        for call in calls:
+            if call.get("name") == "knowledge":
+                assert (call.get("arguments") or {}).get("action") == "search"
 
     def test_offline_path_emits_zero_tool_calls(self, tmp_path):
         """When MCP is unreachable, the helper falls back to the bundled
@@ -1210,7 +1223,7 @@ class TestOrchestratorProvisionedLineage:
         assert "rm -rf" not in ctx
         assert 'spawn_reason="subagent"' in ctx
 
-    def test_env_lineage_makes_no_tool_calls(self, tmp_path):
+    def test_env_lineage_makes_no_state_mutations(self, tmp_path):
         """The new source keeps the load-bearing no-mutation invariant."""
         _, calls = _serve_and_run(
             tmp_path,
@@ -1218,7 +1231,11 @@ class TestOrchestratorProvisionedLineage:
         )
         mutating = [
             c for c in calls
-            if (c.get("tool") or c.get("name") or "") not in ("", "skills")
+            if (c.get("tool") or c.get("name") or "") not in ("", "skills", "knowledge")
+            or (
+                (c.get("tool") or c.get("name") or "") == "knowledge"
+                and (c.get("arguments") or {}).get("action") != "search"
+            )
         ]
         assert mutating == []
 
