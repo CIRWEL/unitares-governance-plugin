@@ -34,6 +34,7 @@ to be present.
 | Governance rewrite | known Claude/legacy aliases; `updatedInput` without a permission decision | canonical `unitares-governance` alias only; rewrite plus required allow only for anchored lifecycle, check-in, and read-only diagnostics |
 | Configuration precedence | explicit environment, then `defaults.env` fallback | explicit environment, then `defaults.env` fallback |
 | Post-edit policy | synchronous lease release alongside asynchronous local milestone plus optional watcher/auto-checkin | synchronous and bounded; lease cleanup plus local milestone only |
+| Long-turn liveness | Stop and edit-threshold lifecycle signals | every completed PostToolUse receipt updates a local, identity-free slot ledger |
 | Identity response | asynchronous; commits only against the exact PreToolUse cache-generation snapshot | synchronous; uses the same tool-scoped generation guard |
 | Workspace briefing | dirty sibling worktrees, opt-out available | skipped to preserve the synchronous SessionStart budget |
 | Session end | sub-second best-effort lease cleanup; Stop owns governance delivery | bounded lease cleanup only; Stop owns governance delivery |
@@ -55,7 +56,21 @@ older installations.
 Claude may run network-bearing post hooks asynchronously. Codex does not
 currently support async command handlers, so synchronous edit hooks have a
 six-second manifest timeout and stricter internal deadlines. Turn-level Codex
-governance remains the Stop hook's responsibility, not PostToolUse's.
+governance remains the Stop hook's responsibility, not PostToolUse's. The broad
+Codex PostToolUse activity hook is a deliberately narrower sensor: it performs
+only a bounded local ledger update and never writes to an agent trajectory or
+to the identity-free dark-session floor.
+
+That provenance boundary is ontological, not just operational. An explicit
+`sync_state` is agent-authored proprioceptive state. A Stop summary is a
+hook-derived `substrate_interpretation` associated with the bound process. The
+local activity ledger says only that the host delivered a completed
+PostToolUse event for the slot. It contains no UUID, client session binding,
+tool content, EISV, verdict, intent, or semantic progress claim. Tool-free
+sampling and a single long-running tool call remain invisible until another
+host event or Stop. An App Server/SDK event observer plus a dedicated
+host-observation sink is the better integration when the orchestrator owns
+Codex directly and needs complete central lifecycle telemetry.
 
 Identity tools (`onboard`, `start_session`, `identity`, and `bind_session`) are
 paired across PreToolUse and PostToolUse by `tool_use_id`. PreToolUse reserves
