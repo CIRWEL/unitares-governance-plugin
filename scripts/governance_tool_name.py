@@ -20,7 +20,14 @@ GOVERNANCE_SERVER_ALIASES = frozenset(
         "plugin_unitares-governance_unitares-governance",
     }
 )
-CODEX_GOVERNANCE_SERVER_ALIASES = frozenset({"unitares-governance"})
+# Codex exposes the configured MCP server name in two equivalent forms at the
+# hook boundary. Direct/native tool calls retain the TOML alias, while tools
+# invoked through code mode normalize ``-`` to ``_`` in ``tool_name``. Trust
+# both exact spellings; do not broaden this to substring matching or to the
+# generic Claude aliases above.
+CODEX_GOVERNANCE_SERVER_ALIASES = frozenset(
+    {"unitares-governance", "unitares_governance"}
+)
 
 
 def governance_server_aliases(host: str | None = None) -> frozenset[str]:

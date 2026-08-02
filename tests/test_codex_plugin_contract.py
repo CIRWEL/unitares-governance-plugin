@@ -58,6 +58,7 @@ def test_defaults_preserve_explicit_operator_environment():
         "UNITARES_SERVER_URL": "https://governance.example.test",
         "UNITARES_CHECKINS": "off",
         "UNITARES_AUTO_CHECKIN_ENABLED": "0",
+        "UNITARES_CODEX_LIVENESS": "off",
         "UNITARES_FILE_LEASES_ENABLED": "0",
         "UNITARES_FILE_LEASES_REQUIRED": "1",
         "LEASE_PLANE_BASE_URL": "https://leases.example.test",
@@ -65,12 +66,15 @@ def test_defaults_preserve_explicit_operator_environment():
     env.pop("UNITARES_FILE_LEASE_TTL_S", None)
     env.pop("UNITARES_AUTO_CHECKIN_CLAIM_TTL_S", None)
     env.pop("UNITARES_WATCHER_ENABLED", None)
+    env.pop("UNITARES_CODEX_ACTIVITY_LOCK_TIMEOUT_S", None)
     script = r'''
 source "$1"
 "$2" -c 'import json, os; print(json.dumps([
     os.environ["UNITARES_SERVER_URL"],
     os.environ["UNITARES_CHECKINS"],
     os.environ["UNITARES_AUTO_CHECKIN_ENABLED"],
+    os.environ["UNITARES_CODEX_LIVENESS"],
+    os.environ["UNITARES_CODEX_ACTIVITY_LOCK_TIMEOUT_S"],
     os.environ["UNITARES_FILE_LEASES_ENABLED"],
     os.environ["UNITARES_FILE_LEASES_REQUIRED"],
     os.environ["UNITARES_FILE_LEASE_TTL_S"],
@@ -93,6 +97,8 @@ source "$1"
         "https://governance.example.test",
         "off",
         "0",
+        "off",
+        "1.0",
         "0",
         "1",
         "300",
@@ -145,6 +151,21 @@ def test_codex_hooks_are_synchronous_and_cover_continuity_path():
     ]
     assert len(edit_handlers) == 1
     assert edit_handlers[0]["timeout"] <= 6
+
+    activity_handlers = [
+        (group, handler)
+        for event, group, handler in handlers
+        if event == "PostToolUse"
+        and _invokes(handler, "post-activity", host="codex")
+    ]
+    assert len(activity_handlers) == 1
+    activity_group, activity_handler = activity_handlers[0]
+    assert re.fullmatch(activity_group["matcher"], "functions.exec")
+    assert re.fullmatch(
+        activity_group["matcher"],
+        "mcp__unitares_governance__start_session",
+    )
+    assert activity_handler["timeout"] <= 4
     assert config["hooks"]["SessionEnd"][0]["matcher"] == "other"
 
     stop_handler = next(
