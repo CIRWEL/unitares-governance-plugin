@@ -230,11 +230,13 @@ fi
 SUMMARY=$(_stop_field summary)
 COMPLEXITY=$(_stop_field complexity)
 
+# No --confidence: this turn summary is a substrate reading of tool shape, not
+# an agent's belief about its own work. A supplied value mints a tactical
+# prediction server-side and is scored into the fleet calibration curve.
 python3 "${PLUGIN_ROOT}/scripts/checkin.py" \
   --event turn_stop \
   --response-text "${SUMMARY}" \
   --complexity "${COMPLEXITY}" \
-  --confidence 0.7 \
   --epistemic-class substrate_interpretation \
   --client-session-id "${CSID}" \
   --uuid "${UUID}" \

@@ -184,7 +184,7 @@ after check-ins, and exposes `GET /audit`. Useful endpoints:
 - `GET http://127.0.0.1:8768/client-config?slot=codex-local` for a generated MCP/client snippet
 - `POST http://127.0.0.1:8768/v1/tools/call` with `{"name": "...", "arguments": {...}}`
 - `POST http://127.0.0.1:8768/mcp/` for JSON-RPC MCP requests; `tools/call` is intercepted and other JSON requests pass through
-- `POST http://127.0.0.1:8768/turn/checkin` with `response_text`, `complexity`, and `confidence`
+- `POST http://127.0.0.1:8768/turn/checkin` with `response_text`, `complexity`, and an optional `confidence`. Omit `confidence` unless the caller is stating an agent-authored belief: the server mints a tactical prediction from any value supplied and scores it into the calibration curve, so a placeholder becomes a forecast nobody made.
 - `POST http://127.0.0.1:8768/turn/stop` for an end-of-turn check-in
 - `GET http://127.0.0.1:8768/audit?log_tail=200` for bounded local cache/log contract findings
 

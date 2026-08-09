@@ -515,7 +515,14 @@ class IdentitySidecar:
             event=event,
             response_text=str(body.get("response_text") or body.get("summary") or "Sidecar turn check-in"),
             complexity=float(body.get("complexity", 0.3)),
-            confidence=float(body.get("confidence", 0.7)),
+            # Pass through only what the caller actually stated. Defaulting a
+            # missing confidence mints a tactical prediction the caller never
+            # made; None omits the field and mints nothing.
+            confidence=(
+                float(body["confidence"])
+                if body.get("confidence") is not None
+                else None
+            ),
             client_session_id=sid.strip(),
             slot=slot,
             uuid=str(session.get("uuid", "")),

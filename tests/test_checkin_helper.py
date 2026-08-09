@@ -179,13 +179,14 @@ def test_submit_checkin_never_raises_on_garbage_inputs(monkeypatch, tmp_path):
     log_path = tmp_path / "checkins.log"
     monkeypatch.setenv("UNITARES_CHECKIN_LOG", str(log_path))
 
-    # None for numeric fields — float(None) raises TypeError
+    # None complexity — float(None) raises TypeError. (A None *confidence* is
+    # legal and simply omits the field; complexity is what fails here.)
     with patch("checkin._post_to_governance", return_value=(True, 1, None)):
         result = checkin.submit_checkin(
             event="turn_stop",
             response_text="x",
             complexity=None,  # type: ignore[arg-type]
-            confidence=None,  # type: ignore[arg-type]
+            confidence=None,
             client_session_id="agent-x",
             continuity_token="v1.t",
             slot="s",
@@ -295,6 +296,58 @@ def test_payload_can_label_hook_interpretation(monkeypatch, tmp_path):
     args = captured["payload"]["arguments"]
     assert args["epistemic_class"] == "substrate_interpretation"
     assert args["metadata"]["event"] == "auto_edit"
+
+
+def test_omitted_confidence_is_not_sent(monkeypatch, tmp_path):
+    """A hook holds no belief, so it must not mint a tactical prediction.
+
+    process_agent_update registers a tactical prediction whenever `confidence`
+    is present, and that prediction is scored into the fleet calibration curve.
+    A hook-supplied constant would therefore appear as a real forecast that no
+    agent ever made.
+    """
+    monkeypatch.setenv("UNITARES_CHECKIN_LOG", str(tmp_path / "cl.log"))
+    captured: dict = {}
+
+    def fake_post(url, payload, timeout=5.0):
+        captured["payload"] = payload
+        return True, 33, None
+
+    with patch("checkin._post_to_governance", side_effect=fake_post):
+        checkin.submit_checkin(
+            event="turn_stop",
+            response_text="did stuff",
+            complexity=0.4,
+            client_session_id="agent-abc1234567",
+            slot="slot-1",
+            epistemic_class="substrate_interpretation",
+        )
+
+    args = captured["payload"]["arguments"]
+    assert "confidence" not in args
+    assert args["complexity"] == 0.4
+
+
+def test_explicit_confidence_still_rides(monkeypatch, tmp_path):
+    """An agent-authored confidence is still forwarded and clamped."""
+    monkeypatch.setenv("UNITARES_CHECKIN_LOG", str(tmp_path / "cl.log"))
+    captured: dict = {}
+
+    def fake_post(url, payload, timeout=5.0):
+        captured["payload"] = payload
+        return True, 33, None
+
+    with patch("checkin._post_to_governance", side_effect=fake_post):
+        checkin.submit_checkin(
+            event="turn_stop",
+            response_text="did stuff",
+            complexity=0.4,
+            confidence=1.8,
+            client_session_id="agent-abc1234567",
+            slot="slot-1",
+        )
+
+    assert captured["payload"]["arguments"]["confidence"] == 1.0
 
 
 def test_plugin_version_matches_package_metadata():

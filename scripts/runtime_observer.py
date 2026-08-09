@@ -1,11 +1,38 @@
 #!/usr/bin/env python3
-"""Bounded, audit-only Codex host-observation scheduler.
+"""Bounded Codex host-observation scheduler.
 
 One detached worker may be started after a completed-tool hook for a Codex
-slot. Activity rollups and optional hook-parent heartbeats go only to the
-legacy ``/v1/runtime/observe`` route and are stored as identity-bound audit
-evidence. Neither path proves continuous agent runtime, calls
-``process_agent_update``, or creates EISV state.
+slot. Activity rollups and optional hook-parent heartbeats go to the legacy
+``/v1/runtime/observe`` route and are stored as identity-bound audit evidence.
+Neither path proves continuous agent runtime.
+
+The two kinds are not the same class of evidence, and they are routed
+differently (the payload says so itself, via ``session_activity_evidence`` and
+``agent_runtime_evidence``):
+
+``heartbeat`` — hook-parent process liveness
+    Reports that the *hook parent* PID exists. Codex desktop may share that PID
+    across chats, so it is not evidence of an agent at all. Opt-in
+    (``UNITARES_CODEX_HOST_HEARTBEATS``, default off). It never calls
+    ``process_agent_update`` and never creates EISV state, matching the
+    server-side invariant in ``src/runtime_observations.py``.
+
+``activity_rollup`` carrying ``session_activity_evidence`` — completed-tool receipts
+    A receipt that N tools completed in a bounded window. That is a behavioral
+    observable of the same class Claude's Stop hook already submits as a
+    ``substrate_interpretation`` check-in (turn shape -> complexity), so this
+    path submits one too. Codex has no equivalent per-turn Stop cadence, so
+    without it a Codex slot accumulates audit presence but no governed state —
+    and the behavioral estimator returns nothing below three history entries.
+
+    ``substrate_interpretation`` is explicitly NOT an agent-authored check-in,
+    which is what ``runtime_observations.py`` forbids synthesizing. The
+    distinction is the whole point: the substrate may describe what it observed;
+    only the agent may speak in the agent's voice.
+
+A rollup without ``session_activity_evidence`` (no completed tools) submits
+nothing, so an idle or undelivered window can never be mistaken for a calm
+agent.
 """
 
 from __future__ import annotations
@@ -37,7 +64,7 @@ from activity_observer import (  # noqa: E402
     activity_state_path,
     slot_from_activity_payload,
 )
-from checkin import _plugin_version  # noqa: E402
+from checkin import _plugin_version, submit_checkin  # noqa: E402
 
 
 DEFAULT_SERVER_URL = "http://localhost:8767"
@@ -183,6 +210,29 @@ def _event_id(
     return str(uuid.uuid5(_EVENT_NAMESPACE, key))
 
 
+def rollup_complexity(tool_delta: int) -> float:
+    """Complexity for a rollup window, on Claude's Stop-hook scale.
+
+    ``scripts/stop_hook_event.py`` derives a turn's complexity as
+    ``min(tool_count / 10, 0.85)``. A rollup window is the same quantity
+    measured over a bounded interval instead of a turn, so it uses the same
+    curve — the two hosts stay comparable rather than each inventing a scale.
+    """
+    return min(max(0, int(tool_delta)) / 10.0, 0.85)
+
+
+def rollup_summary(tool_delta: int, window_seconds: float) -> str:
+    """Describe the window in observed quantities only.
+
+    Deliberately free of intent or progress language: this is a tool-completion
+    receipt, not a claim about what the agent was trying to do.
+    """
+    minutes = max(0.0, float(window_seconds)) / 60.0
+    tools = max(0, int(tool_delta))
+    plural = "" if tools == 1 else "s"
+    return f"{tools} tool call{plural} completed over {minutes:.0f}m (codex runtime window)"
+
+
 def _post_runtime(
     url: str,
     payload: dict[str, Any],
@@ -294,10 +344,12 @@ def observation_cycle(
     slot: str,
     now: float | None = None,
     runtime_sender: Callable[[str, dict[str, Any]], bool] | None = None,
+    checkin_sender: Callable[..., str] | None = None,
     expected_worker_pid: int | None = None,
 ) -> dict[str, str]:
     """Execute one bounded worker cycle; exposed for deterministic tests."""
     timestamp = time.time() if now is None else float(now)
+    checkin_sender = checkin_sender or submit_checkin
     runtime_sender = runtime_sender or (
         lambda url, payload: _post_runtime(
             url,
@@ -400,17 +452,57 @@ def observation_cycle(
         )
         runtime_ok = runtime_sender(server_url, runtime_payload)
         outcomes["activity_observation"] = "sent" if runtime_ok else "failed"
+
+        # Submit the same window as a substrate_interpretation check-in so a
+        # Codex slot accumulates governed state, not just audit presence.
+        #
+        # Gated on `runtime_ok` because that is the same commit point as the
+        # ledger: `last_rollup_count` only advances when the observation lands,
+        # so a failed send is retried with an identical `tool_delta`. Firing the
+        # check-in on every attempt would submit the same work twice.
+        #
+        # Gated on the payload's own `session_activity_evidence` flag rather
+        # than re-deriving `tool_delta > 0` here: that flag is what the
+        # observation asserted on the wire, so the check-in cannot drift from
+        # the receipt it claims to summarize. A window with no completed tools
+        # is not evidence of a calm agent — it is the absence of evidence, and
+        # the estimator must not read one as the other.
+        checkin_status = "skipped_no_work"
+        if runtime_ok and runtime_payload.get("session_activity_evidence"):
+            checkin_status = checkin_sender(
+                event="codex_activity_rollup",
+                response_text=rollup_summary(tool_delta, window_seconds),
+                complexity=rollup_complexity(tool_delta),
+                # No confidence: a tool-completion receipt carries no belief.
+                # Supplying one would mint a tactical prediction that no agent
+                # made and score it into the fleet calibration curve.
+                confidence=None,
+                client_session_id=str(session.get("client_session_id") or ""),
+                slot=slot,
+                uuid=str(session.get("uuid") or ""),
+                server_url=server_url,
+                epistemic_class="substrate_interpretation",
+                timeout=_bounded_float(
+                    "UNITARES_CODEX_ROLLUP_CHECKIN_TIMEOUT_S", 10.0, 0.2, 20.0
+                ),
+            )
+        outcomes["activity_checkin"] = checkin_status
+
         with _state_lock(state_path, timeout_s=_lock_timeout_s()):
             current = _read_state(state_path)
             current["last_rollup_attempt_at"] = timestamp
             current["last_activity_observation_status"] = outcomes[
                 "activity_observation"
             ]
+            current["last_activity_checkin_status"] = checkin_status
             if runtime_ok:
                 current["last_rollup_at"] = timestamp
                 current["last_rollup_at_iso"] = _iso(timestamp)
                 current["last_rollup_count"] = tool_count
                 current["network_emission"] = "identity_bound_host_observation"
+            if checkin_status == "sent":
+                current["last_activity_checkin_at"] = timestamp
+                current["last_activity_checkin_at_iso"] = _iso(timestamp)
             _write_state(state_path, current)
 
     outcomes.setdefault("status", "processed")
