@@ -186,7 +186,7 @@ def submit_checkin(
     event: str,
     response_text: str,
     complexity: float,
-    confidence: float,
+    confidence: Optional[float] = None,
     client_session_id: str,
     slot: str,
     continuity_token: str = "",
@@ -206,7 +206,6 @@ def submit_checkin(
         arguments = {
             "response_text": safe_text,
             "complexity": max(0.0, min(1.0, float(complexity))),
-            "confidence": max(0.0, min(1.0, float(confidence))),
             "client_session_id": client_session_id,
             "metadata": {
                 "source": "plugin_hook",
@@ -214,6 +213,16 @@ def submit_checkin(
                 "plugin_version": plugin_version or _plugin_version(),
             },
         }
+        # `confidence` is a belief the agent holds, and a hook holds none. When
+        # the caller has no agent-authored value it must omit the field rather
+        # than substitute a literal: the server mints a tactical prediction from
+        # whatever arrives (process_agent_update registers one whenever
+        # confidence is not None), and that prediction is scored into the
+        # fleet calibration curve. A constant supplied by a hook therefore
+        # shows up as a real, well-calibrated-looking bin that no agent ever
+        # predicted. Omitting it leaves ctx.confidence None and mints nothing.
+        if confidence is not None:
+            arguments["confidence"] = max(0.0, min(1.0, float(confidence)))
         if epistemic_class:
             arguments["epistemic_class"] = epistemic_class
         payload = {
@@ -245,7 +254,17 @@ def _cli() -> int:
     p.add_argument("--event", required=True)
     p.add_argument("--response-text", required=True)
     p.add_argument("--complexity", type=float, required=True)
-    p.add_argument("--confidence", type=float, required=True)
+    p.add_argument(
+        "--confidence",
+        type=float,
+        default=None,
+        help=(
+            "Agent-authored confidence. Omit for substrate-derived check-ins: "
+            "a supplied value mints a tactical prediction that is scored into "
+            "the calibration curve, so a hook-chosen constant becomes a "
+            "fabricated forecast."
+        ),
+    )
     p.add_argument("--client-session-id", required=True)
     p.add_argument(
         "--continuity-token",
