@@ -1,4 +1,4 @@
-"""Contract tests for local, hook-derived Codex liveness."""
+"""Contract tests for local, hook-derived Codex completed-tool evidence."""
 
 from __future__ import annotations
 
@@ -36,14 +36,15 @@ def _state(home: Path, slot: str = "codex-slot") -> dict:
 
 
 def test_record_is_local_and_ledger_is_identity_free(tmp_path):
-    assert activity_observer.record_activity(
-        _payload(), home=tmp_path, now=100.0
-    ) == "recorded"
+    assert (
+        activity_observer.record_activity(_payload(), home=tmp_path, now=100.0)
+        == "recorded"
+    )
 
     state = _state(tmp_path)
     assert state["source"] == "codex_post_tool_use_hook"
     assert state["evidence_source"] == "hook_derived"
-    assert state["measurement_scope"] == "host_event_receipt"
+    assert state["measurement_scope"] == "completed_tool_event_receipt"
     assert state["network_emission"] == "none"
     assert state["slot"] == "codex-slot"
     assert state["tool_count"] == 1
@@ -62,12 +63,16 @@ def test_record_is_local_and_ledger_is_identity_free(tmp_path):
 
 
 def test_completed_tool_events_increment_the_same_slot(tmp_path):
-    assert activity_observer.record_activity(
-        _payload(), home=tmp_path, now=100.0
-    ) == "recorded"
-    assert activity_observer.record_activity(
-        _payload(tool="apply_patch"), home=tmp_path, now=160.0
-    ) == "recorded"
+    assert (
+        activity_observer.record_activity(_payload(), home=tmp_path, now=100.0)
+        == "recorded"
+    )
+    assert (
+        activity_observer.record_activity(
+            _payload(tool="apply_patch"), home=tmp_path, now=160.0
+        )
+        == "recorded"
+    )
 
     state = _state(tmp_path)
     assert state["tool_count"] == 2
@@ -80,7 +85,9 @@ def test_disabled_slotless_or_wrong_event_activity_is_not_recorded(
     tmp_path,
 ):
     monkeypatch.setenv("UNITARES_CODEX_LIVENESS", "off")
-    assert activity_observer.record_activity(_payload(), home=tmp_path) == "skip_disabled"
+    assert (
+        activity_observer.record_activity(_payload(), home=tmp_path) == "skip_disabled"
+    )
     monkeypatch.setenv("UNITARES_CODEX_LIVENESS", "on")
     assert activity_observer.record_activity("{}", home=tmp_path) == "skip_no_slot"
     wrong_event = json.dumps(

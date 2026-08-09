@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Codex hook-liveness observer and runtime-worker trigger.
+"""Local Codex completed-tool observer and host-observation worker trigger.
 
 ``PostToolUse`` proves only that the host delivered a completed-tool event for
 one Codex slot. It does not prove agent intent, semantic progress, EISV state,
@@ -9,10 +9,10 @@ local slot-scoped ledger and performs no network delivery in the hook process.
 The ledger never stores a governance UUID, client session binding, tool input,
 or tool response. Agent-authored state remains the responsibility of
 ``sync_state``. When enabled, the CLI starts a detached per-slot worker that
-emits bounded identity-bound runtime observations and activity rollups. The
-worker is separate so PostToolUse stays local and fast. The identity-free
-``/v1/substrate/observe`` endpoint is intentionally not used: that sink
-measures never-onboarded/dark sessions, not liveness for a bound process.
+emits bounded identity-bound activity rollups. The worker is separate so
+PostToolUse stays local and fast. The identity-free ``/v1/substrate/observe``
+endpoint is intentionally not used: that sink measures never-onboarded/dark
+sessions, not completed-tool receipts for a bound slot.
 """
 
 from __future__ import annotations
@@ -227,7 +227,7 @@ def record_activity(
                     "schema_version": SCHEMA_VERSION,
                     "source": "codex_post_tool_use_hook",
                     "evidence_source": "hook_derived",
-                    "measurement_scope": "host_event_receipt",
+                    "measurement_scope": "completed_tool_event_receipt",
                     "network_emission": state.get("network_emission", "none"),
                     "slot": slot,
                     "first_activity_at": first_at,
@@ -264,7 +264,7 @@ def _cli() -> int:
                 host_pid=args.host_pid,
             )
         except Exception:
-            # The liveness worker is best-effort. A scheduler failure must not
+            # The host-observation worker is best-effort. A scheduler failure must not
             # make a successful PostToolUse hook visible to the host.
             pass
     print(result)

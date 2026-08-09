@@ -2,7 +2,7 @@
 # UNITARES Governance Plugin — Codex PostToolUse activity sensor
 #
 # Records a completed-tool receipt under the raw Codex slot and ensures the
-# detached per-slot runtime worker is running. The synchronous hook remains
+# detached per-slot host-observation worker is running. The synchronous hook remains
 # local-only; network delivery happens outside the Codex hook timeout.
 set -uo pipefail
 

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Bounded, audit-only Codex runtime observation scheduler.
+"""Bounded, audit-only Codex host-observation scheduler.
 
-One detached worker is kept per Codex slot while the host process is alive.
-Both ``heartbeat`` and ``activity_rollup`` observations go only to
-``/v1/runtime/observe`` and are stored as identity-bound audit evidence.
-Neither path calls ``process_agent_update`` or creates EISV state.
+One detached worker may be started after a completed-tool hook for a Codex
+slot. Activity rollups and optional hook-parent heartbeats go only to the
+legacy ``/v1/runtime/observe`` route and are stored as identity-bound audit
+evidence. Neither path proves continuous agent runtime, calls
+``process_agent_update``, or creates EISV state.
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ DEFAULT_ROLLUP_S = 1800.0
 DEFAULT_ROLLUP_TOOLS = 25
 DEFAULT_COOLDOWN_S = 600.0
 DEFAULT_HTTP_TIMEOUT_S = 5.0
+DEFAULT_IDLE_EXIT_S = 3600.0
 EXECUTION_MODES = {"interactive", "automation", "ephemeral", "unknown"}
 _EVENT_NAMESPACE = uuid.UUID("63a3c5f5-e15e-4ac8-ae3a-8adf3cfecc91")
 
@@ -79,6 +81,11 @@ def runtime_enabled() -> bool:
         and _truthy(os.environ.get("UNITARES_CODEX_RUNTIME_OBSERVATIONS"), default=True)
         and os.environ.get("UNITARES_CHECKINS", "on").strip().lower() != "off"
     )
+
+
+def host_heartbeats_enabled() -> bool:
+    """Return whether explicitly requested hook-parent heartbeats are enabled."""
+    return _truthy(os.environ.get("UNITARES_CODEX_HOST_HEARTBEATS"), default=False)
 
 
 def _iso(epoch: float) -> str:
@@ -224,11 +231,19 @@ def _runtime_payload(
         "tool_delta": max(0, tool_delta),
         "window_seconds": max(0.0, window_seconds),
         "plugin_version": _plugin_version(),
+        "measurement_scope": (
+            "hook_parent_process_liveness"
+            if kind == "heartbeat"
+            else "completed_tool_event_receipts"
+        ),
+        "session_activity_evidence": kind == "activity_rollup" and tool_delta > 0,
+        "agent_runtime_evidence": False,
     }
     if seconds_since_last_tool is not None:
         payload["seconds_since_last_tool"] = max(0.0, seconds_since_last_tool)
     if kind == "heartbeat":
         payload["host_process_alive"] = True
+        payload["host_process_scope"] = "hook_parent"
     payload["event_id"] = _event_id(
         agent_uuid=session["uuid"],
         session_id=session["client_session_id"],
@@ -260,8 +275,12 @@ def due_actions(state: dict[str, Any], *, now: float) -> tuple[bool, bool]:
 
     worker_started = float(state.get("worker_started_at") or now)
     last_heartbeat = float(state.get("last_heartbeat_at") or worker_started)
-    heartbeat_due = now - last_heartbeat >= _bounded_float(
-        "UNITARES_CODEX_HEARTBEAT_SECS", DEFAULT_HEARTBEAT_S, 300.0, 21600.0
+    heartbeat_due = (
+        host_heartbeats_enabled()
+        and now - last_heartbeat
+        >= _bounded_float(
+            "UNITARES_CODEX_HEARTBEAT_SECS", DEFAULT_HEARTBEAT_S, 300.0, 21600.0
+        )
     )
     heartbeat_attempt = float(state.get("last_heartbeat_attempt_at") or 0.0)
     heartbeat_due = heartbeat_due and now - heartbeat_attempt >= min(cooldown, 300.0)
@@ -353,7 +372,7 @@ def observation_cycle(
             if ok:
                 current["last_heartbeat_at"] = heartbeat_at
                 current["last_heartbeat_at_iso"] = observed_at
-                current["network_emission"] = "identity_bound_runtime_observation"
+                current["network_emission"] = "identity_bound_host_observation"
             _write_state(state_path, current)
 
     if rollup_due:
@@ -391,7 +410,7 @@ def observation_cycle(
                 current["last_rollup_at"] = timestamp
                 current["last_rollup_at_iso"] = _iso(timestamp)
                 current["last_rollup_count"] = tool_count
-                current["network_emission"] = "identity_bound_runtime_observation"
+                current["network_emission"] = "identity_bound_host_observation"
             _write_state(state_path, current)
 
     outcomes.setdefault("status", "processed")
@@ -460,6 +479,7 @@ def ensure_runtime_worker(
                 "slot": slot[:256],
                 "host_pid": host_pid,
                 "host_start_token": host_token,
+                "host_process_scope": "hook_parent",
                 "execution_mode": execution_mode,
                 "execution_mode_source": execution_mode_source,
                 "model": model,
@@ -529,6 +549,35 @@ def stop_runtime_worker(
     return "stopped"
 
 
+def _idle_exit_due(state: dict[str, Any], *, now: float) -> bool:
+    """Bound a slot worker even when its hook parent is a shared long-lived PID."""
+    last_evidence = float(
+        state.get("last_activity_at") or state.get("worker_started_at") or now
+    )
+    idle_exit_s = _bounded_float(
+        "UNITARES_CODEX_RUNTIME_IDLE_EXIT_S",
+        DEFAULT_IDLE_EXIT_S,
+        600.0,
+        86400.0,
+    )
+    return now - last_evidence >= idle_exit_s
+
+
+def _clear_worker_registration(state_path: Path, worker_pid: int) -> None:
+    """Clear only this worker's registration; never clobber a replacement."""
+    try:
+        with _state_lock(state_path, timeout_s=_lock_timeout_s()):
+            state = _read_state(state_path)
+            if int(state.get("worker_pid") or 0) != worker_pid:
+                return
+            state.pop("worker_pid", None)
+            state.pop("worker_start_token", None)
+            state.pop("worker_token_verified_at", None)
+            _write_state(state_path, state)
+    except Exception:
+        pass
+
+
 def run_worker(
     *,
     state_path: Path,
@@ -539,19 +588,26 @@ def run_worker(
 ) -> int:
     poll_s = _bounded_float("UNITARES_CODEX_RUNTIME_POLL_S", DEFAULT_POLL_S, 5.0, 300.0)
     worker_pid = os.getpid()
-    while runtime_enabled() and _process_alive(host_pid, host_token):
-        try:
-            result = observation_cycle(
-                state_path,
-                workspace=workspace,
-                slot=slot,
-                expected_worker_pid=worker_pid,
-            )
-        except Exception:
-            result = {"status": "failed"}
-        if result.get("status") == "stopped":
-            break
-        time.sleep(poll_s)
+    try:
+        while runtime_enabled() and _process_alive(host_pid, host_token):
+            try:
+                result = observation_cycle(
+                    state_path,
+                    workspace=workspace,
+                    slot=slot,
+                    expected_worker_pid=worker_pid,
+                )
+            except Exception:
+                result = {"status": "failed"}
+            if result.get("status") == "stopped":
+                break
+            with _state_lock(state_path, timeout_s=_lock_timeout_s()):
+                state = _read_state(state_path)
+            if _idle_exit_due(state, now=time.time()):
+                break
+            time.sleep(poll_s)
+    finally:
+        _clear_worker_registration(state_path, worker_pid)
     return 0
 
 
@@ -564,7 +620,7 @@ def _payload_from_args(value: str | None) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Codex runtime observation worker")
+    parser = argparse.ArgumentParser(description="Codex host-observation worker")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     start = subparsers.add_parser("start")

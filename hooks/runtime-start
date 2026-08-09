@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# UNITARES Governance Plugin — start the detached Codex runtime observer.
+# UNITARES Governance Plugin — compatibility entrypoint for the detached
+# Codex host-observation worker. The packaged SessionStart hook no longer calls
+# this because its parent PID may be shared across unrelated chats.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

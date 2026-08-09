@@ -59,6 +59,8 @@ def test_defaults_preserve_explicit_operator_environment():
         "UNITARES_CHECKINS": "off",
         "UNITARES_AUTO_CHECKIN_ENABLED": "0",
         "UNITARES_CODEX_LIVENESS": "off",
+        "UNITARES_CODEX_HOST_HEARTBEATS": "on",
+        "UNITARES_CODEX_RUNTIME_IDLE_EXIT_S": "7200",
         "UNITARES_FILE_LEASES_ENABLED": "0",
         "UNITARES_FILE_LEASES_REQUIRED": "1",
         "LEASE_PLANE_BASE_URL": "https://leases.example.test",
@@ -67,13 +69,15 @@ def test_defaults_preserve_explicit_operator_environment():
     env.pop("UNITARES_AUTO_CHECKIN_CLAIM_TTL_S", None)
     env.pop("UNITARES_WATCHER_ENABLED", None)
     env.pop("UNITARES_CODEX_ACTIVITY_LOCK_TIMEOUT_S", None)
-    script = r'''
+    script = r"""
 source "$1"
 "$2" -c 'import json, os; print(json.dumps([
     os.environ["UNITARES_SERVER_URL"],
     os.environ["UNITARES_CHECKINS"],
     os.environ["UNITARES_AUTO_CHECKIN_ENABLED"],
     os.environ["UNITARES_CODEX_LIVENESS"],
+    os.environ["UNITARES_CODEX_HOST_HEARTBEATS"],
+    os.environ["UNITARES_CODEX_RUNTIME_IDLE_EXIT_S"],
     os.environ["UNITARES_CODEX_ACTIVITY_LOCK_TIMEOUT_S"],
     os.environ["UNITARES_FILE_LEASES_ENABLED"],
     os.environ["UNITARES_FILE_LEASES_REQUIRED"],
@@ -82,7 +86,7 @@ source "$1"
     os.environ["UNITARES_WATCHER_ENABLED"],
     os.environ["LEASE_PLANE_BASE_URL"],
 ]))'
-'''
+"""
 
     result = subprocess.run(
         ["bash", "-c", script, "bash", str(defaults), sys.executable],
@@ -98,6 +102,8 @@ source "$1"
         "off",
         "0",
         "off",
+        "on",
+        "7200",
         "1.0",
         "0",
         "1",
@@ -106,6 +112,37 @@ source "$1"
         "0",
         "https://leases.example.test",
     ]
+
+
+def test_codex_host_evidence_defaults_are_conservative():
+    defaults = ROOT / "config" / "defaults.env"
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in {
+            "UNITARES_CODEX_HOST_HEARTBEATS",
+            "UNITARES_CODEX_RUNTIME_IDLE_EXIT_S",
+        }
+    }
+    script = r"""
+source "$1"
+"$2" -c 'import json, os; print(json.dumps([
+    os.environ["UNITARES_CODEX_HOST_HEARTBEATS"],
+    os.environ["UNITARES_CODEX_RUNTIME_IDLE_EXIT_S"],
+]))'
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(defaults), sys.executable],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=True,
+    )
+
+    assert json.loads(result.stdout) == ["off", "3600"]
 
 
 def test_codex_hooks_are_synchronous_and_cover_continuity_path():
@@ -117,19 +154,29 @@ def test_codex_hooks_are_synchronous_and_cover_continuity_path():
     handlers = list(_handlers(config))
     assert handlers
     assert all("async" not in handler for _event, _group, handler in handlers)
-    assert all("${PLUGIN_ROOT}" in handler["command"] for _event, _group, handler in handlers)
+    assert all(
+        "${PLUGIN_ROOT}" in handler["command"] for _event, _group, handler in handlers
+    )
     assert all("commandWindows" in handler for _event, _group, handler in handlers)
 
-    assert any(_invokes(handler, "post-stop", host="codex") for _, _, handler in handlers)
-    assert any(_invokes(handler, "session-start", host="codex") for _, _, handler in handlers)
-    assert any(_invokes(handler, "session-end", host="codex") for _, _, handler in handlers)
     assert any(
-        _invokes(handler, "post-identity", host="codex")
-        for _, _, handler in handlers
+        _invokes(handler, "post-stop", host="codex") for _, _, handler in handlers
     )
     assert any(
-        _invokes(handler, "post-checkin", host="codex")
-        for _, _, handler in handlers
+        _invokes(handler, "session-start", host="codex") for _, _, handler in handlers
+    )
+    assert not any(
+        event == "SessionStart" and _invokes(handler, "runtime-start", host="codex")
+        for event, _, handler in handlers
+    )
+    assert any(
+        _invokes(handler, "session-end", host="codex") for _, _, handler in handlers
+    )
+    assert any(
+        _invokes(handler, "post-identity", host="codex") for _, _, handler in handlers
+    )
+    assert any(
+        _invokes(handler, "post-checkin", host="codex") for _, _, handler in handlers
     )
     assert any(
         _invokes(handler, "pre-governance-call", host="codex")
@@ -155,8 +202,7 @@ def test_codex_hooks_are_synchronous_and_cover_continuity_path():
     activity_handlers = [
         (group, handler)
         for event, group, handler in handlers
-        if event == "PostToolUse"
-        and _invokes(handler, "post-activity", host="codex")
+        if event == "PostToolUse" and _invokes(handler, "post-activity", host="codex")
     ]
     assert len(activity_handlers) == 1
     activity_group, activity_handler = activity_handlers[0]
@@ -370,7 +416,8 @@ def test_claude_separates_sync_lease_release_from_async_post_hooks():
         if event == "PermissionDenied"
     )
     assert not any(
-        "release-session" in handler["command"] or "session-lease-release" in handler["command"]
+        "release-session" in handler["command"]
+        or "session-lease-release" in handler["command"]
         for event, _group, handler in _handlers(claude)
         if event == "Stop"
     )
@@ -385,7 +432,8 @@ def test_claude_separates_sync_lease_release_from_async_post_hooks():
         encoding="utf-8"
     )
     assert not any(
-        "release-session" in handler["command"] or "session-lease-release" in handler["command"]
+        "release-session" in handler["command"]
+        or "session-lease-release" in handler["command"]
         for event, _group, handler in _handlers(codex)
         if event == "Stop"
     )
