@@ -86,6 +86,9 @@ def test_activity_rollup_is_bounded_audit_only(monkeypatch, tmp_path):
     assert runtime_payload["execution_mode"] == "unknown"
     assert runtime_payload["execution_mode_source"] == "unspecified"
     assert runtime_payload["model"] == ""
+    assert runtime_payload["measurement_scope"] == "completed_tool_event_receipts"
+    assert runtime_payload["session_activity_evidence"] is True
+    assert runtime_payload["agent_runtime_evidence"] is False
     assert "host_process_alive" not in runtime_payload
     assert "response_text" not in runtime_payload
 
@@ -152,6 +155,7 @@ def test_failed_activity_observation_remains_pending(monkeypatch, tmp_path):
 
 
 def test_heartbeat_is_audit_only(monkeypatch, tmp_path):
+    monkeypatch.setenv("UNITARES_CODEX_HOST_HEARTBEATS", "on")
     monkeypatch.setenv("UNITARES_CODEX_HEARTBEAT_SECS", "300")
     _seed_session(tmp_path)
     state_path = _seed_activity(tmp_path, count=1)
@@ -168,8 +172,90 @@ def test_heartbeat_is_audit_only(monkeypatch, tmp_path):
     assert result == {"heartbeat": "sent", "status": "processed"}
     assert runtime_calls[0]["observation_kind"] == "heartbeat"
     assert runtime_calls[0]["host_process_alive"] is True
+    assert runtime_calls[0]["host_process_scope"] == "hook_parent"
+    assert runtime_calls[0]["measurement_scope"] == "hook_parent_process_liveness"
+    assert runtime_calls[0]["session_activity_evidence"] is False
+    assert runtime_calls[0]["agent_runtime_evidence"] is False
     assert runtime_calls[0]["seconds_since_last_tool"] == 300.0
     assert "response_text" not in runtime_calls[0]
+
+
+def test_hook_parent_heartbeat_is_disabled_by_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("UNITARES_CODEX_HOST_HEARTBEATS", raising=False)
+    monkeypatch.setenv("UNITARES_CODEX_HEARTBEAT_SECS", "300")
+    _seed_session(tmp_path)
+    state_path = _seed_activity(tmp_path, count=1)
+    calls = []
+
+    assert runtime_observer.observation_cycle(
+        state_path,
+        workspace=tmp_path,
+        slot=SLOT,
+        now=400.0,
+        runtime_sender=lambda url, payload: calls.append(payload) or True,
+    ) == {"status": "idle"}
+    assert calls == []
+
+
+def test_worker_idle_exit_is_bounded_by_last_completed_tool(monkeypatch):
+    monkeypatch.setenv("UNITARES_CODEX_RUNTIME_IDLE_EXIT_S", "600")
+    state = {"worker_started_at": 50.0, "last_activity_at": 100.0}
+
+    assert runtime_observer._idle_exit_due(state, now=699.0) is False
+    assert runtime_observer._idle_exit_due(state, now=700.0) is True
+
+
+def test_worker_registration_cleanup_is_pid_guarded(tmp_path):
+    state_path = _seed_activity(tmp_path, count=1)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.update(
+        {
+            "worker_pid": 222,
+            "worker_start_token": "token-222",
+            "worker_token_verified_at": 100.0,
+        }
+    )
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    runtime_observer._clear_worker_registration(state_path, 333)
+    assert json.loads(state_path.read_text(encoding="utf-8"))["worker_pid"] == 222
+
+    runtime_observer._clear_worker_registration(state_path, 222)
+    cleaned = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "worker_pid" not in cleaned
+    assert "worker_start_token" not in cleaned
+    assert "worker_token_verified_at" not in cleaned
+
+
+def test_worker_exits_and_unregisters_after_slot_idle_timeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("UNITARES_CODEX_LIVENESS", "on")
+    monkeypatch.setenv("UNITARES_CODEX_RUNTIME_OBSERVATIONS", "on")
+    monkeypatch.setenv("UNITARES_CHECKINS", "on")
+    monkeypatch.setenv("UNITARES_CODEX_RUNTIME_IDLE_EXIT_S", "600")
+    state_path = _seed_activity(tmp_path, count=1)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.update({"worker_pid": 222, "worker_started_at": 100.0})
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(runtime_observer.os, "getpid", lambda: 222)
+    monkeypatch.setattr(runtime_observer.time, "time", lambda: 700.0)
+    monkeypatch.setattr(runtime_observer, "_process_alive", lambda pid, token="": True)
+    monkeypatch.setattr(
+        runtime_observer.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(AssertionError("worker slept")),
+    )
+
+    assert (
+        runtime_observer.run_worker(
+            state_path=state_path,
+            workspace=tmp_path,
+            slot=SLOT,
+            host_pid=111,
+            host_token="token-111",
+        )
+        == 0
+    )
+    assert "worker_pid" not in json.loads(state_path.read_text(encoding="utf-8"))
 
 
 def test_execution_context_is_explicit_and_model_is_descriptive(monkeypatch):

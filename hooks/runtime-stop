@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# UNITARES Governance Plugin — stop the detached Codex runtime observer.
+# UNITARES Governance Plugin — stop the detached Codex host-observation worker.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

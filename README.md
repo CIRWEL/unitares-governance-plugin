@@ -111,7 +111,7 @@ another process identity. Once a process is bound, continue it with
 
 1. `start_session(force_new=true)` once at process start, to mint a fresh process identity (`onboard(...)` is the canonical equivalent) — until you onboard, this process has no governance identity
 2. if this fresh process is a real handoff from finished prior work, pass `parent_agent_id=<prior uuid>` and `spawn_reason="new_session"`
-3. call `sync_state()` once per assistant turn as a behavioral baseline, and after meaningful work (`process_agent_update(...)` is the canonical equivalent) — an identity that never checks in produces no governance signal
+3. call `sync_state()` when there is meaningful agent state to report, usually at most once per assistant turn (`process_agent_update(...)` is the canonical equivalent) — automatic Stop interpretations and bootstrap rows remain separately labeled
 4. call `check_working_state()` for read-only state
 5. use `identity(agent_uuid=..., continuity_token=..., resume=true)` only for same-live-owner proof-owned rebinds
 6. call `identity()` and `health_check()` when diagnosis is needed
@@ -235,6 +235,10 @@ including `0` and `off` kill switches:
 | `UNITARES_SESSION_CACHE_LOCK_TIMEOUT_S` | `2.0` | Maximum wait for a slot-scoped session-cache transaction (clamped to four seconds) |
 | `UNITARES_AUTO_CHECKIN_CLAIM_TTL_S` | `30` | Crash-recovery expiry for Claude's single in-flight edit check-in claim (clamped to 30-120 seconds) |
 | `UNITARES_WATCHER_ENABLED` | `0` | Opt in to the explicitly configured `UNITARES_WATCHER_HOOK`; workspace-local executables are never auto-run |
+| `UNITARES_CODEX_LIVENESS` | `on` | Record local, slot-scoped completed-tool receipts; these are not check-ins or agent runtime |
+| `UNITARES_CODEX_RUNTIME_OBSERVATIONS` | `on` | Emit bounded completed-tool rollups to the legacy runtime-named audit sink |
+| `UNITARES_CODEX_HOST_HEARTBEATS` | `off` | Opt in to hook-parent PID heartbeats; a shared host PID never proves per-agent runtime |
+| `UNITARES_CODEX_RUNTIME_IDLE_EXIT_S` | `3600` | Stop a detached slot worker after this many seconds without a completed-tool receipt |
 | `LEASE_PLANE_BASE_URL` | `http://127.0.0.1:8788` | BEAM lease-plane HTTP base URL |
 | `LEASE_PLANE_BEARER_TOKEN` | unset | Bearer used for lease-plane acquire, heartbeat, and release calls |
 
@@ -244,7 +248,7 @@ Adapters are a convenience layer over the governance server, not the canonical
 policy — the server stays the source of truth and the client stays thin.
 
 - **Claude** — host-native lifecycle hooks, asynchronous edit check-ins, batch-completion cleanup, and BEAM file leases.
-- **Codex/ChatGPT** — synchronous lifecycle hooks, multi-file apply_patch leases, Stop cleanup, local edit milestones, and slot-scoped continuity cache.
+- **Codex/ChatGPT** — synchronous lifecycle hooks, multi-file apply_patch leases, Stop cleanup, local edit milestones, slot-scoped continuity cache, and separately labeled completed-tool audit evidence.
 - **Sidecar** — a dependency-free local proxy/facade for clients without lifecycle hooks; recommended for local/non-frontier model runners that should not manage identity proof material in prompt context.
 - **Hermes Agent** — native lifecycle binding lives in `unitares-host-adapter`; this repo is only relevant to Hermes if you deliberately route through the generic sidecar instead.
 
@@ -264,10 +268,14 @@ This repo should not:
 
 ## Check-In Triggers
 
-The Claude adapter emits canonical `process_agent_update` calls at two trigger
-points (`turn_stop` and `auto_edit`) through one shared helper
-(`scripts/checkin.py`) that redacts secrets, truncates, logs, and is
-fire-and-forget. A `UNITARES_CHECKINS=off` kill switch suppresses all of them.
+The Claude adapter emits canonical `process_agent_update` calls at `turn_stop`
+and `auto_edit`. Codex Stop may emit one automatic `turn_stop`
+`substrate_interpretation`; a manual `sync_state()` is the separately labeled
+agent-authored check-in and is usually needed no more than once per turn.
+Synthetic onboarding initialization and PostToolUse receipts are not real
+check-ins. All adapter check-ins use `scripts/checkin.py`, which redacts
+secrets, truncates, logs, and is fire-and-forget. A `UNITARES_CHECKINS=off` kill
+switch suppresses them and the host-observation bridge.
 
 For the trigger table, the diagnostic log format, the protective audit, the
 known token-auth limitation, and plugin-cache upgrade steps, see

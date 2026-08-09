@@ -69,20 +69,23 @@ codex mcp add unitares-governance \
 ## Goal
 
 Connect to a running UNITARES governance server, preserve continuity cleanly,
-and check in once per assistant turn as a behavioral baseline. A new user
-message is not a new process identity: call `start_session(force_new=true)` once
-per fresh process, then continue with `client_session_id`-backed check-ins. Add
-milestone check-ins for substantial work; avoid per-tool or per-edit noise.
+and check in when there is meaningful agent state to report — usually zero or
+one `sync_state()` call per assistant turn. A new user message is not a new
+process identity: call `start_session(force_new=true)` once per fresh process,
+then continue with `client_session_id`-backed check-ins. The automatic Stop
+summary is a non-agent-authored substrate interpretation, not a replacement
+agent report. Avoid per-tool or per-edit check-in noise.
 
 ## Recommended Default
 
 Use `explicit` mode unless you are deliberately dogfooding tighter automation.
 When Codex lifecycle hooks are configured and trusted, Codex also has a light
 native hook path: `SessionStart` shows the governance nudge, `PostToolUse`
-records identity/check-in cache updates, `PreToolUse` injects the cached
-`client_session_id` into later governance calls, and `Stop` emits one
-turn-level substrate check-in. This does **not** turn every edit or tool call
-into a check-in.
+records completed-tool receipts and identity/check-in cache updates for matching
+governance calls, `PreToolUse` injects the cached `client_session_id` into later
+governance calls, and `Stop` emits one turn-level substrate interpretation. This
+does **not** turn every edit or tool call into a check-in or prove continuous
+agent runtime.
 
 ### Modes
 
@@ -136,22 +139,24 @@ debugging the underlying protocol.
 1. Follow the bundled `unitares-governance:governance-lifecycle` skill and call `start_session(force_new=true)`
 2. Keep continuity in slot-scoped `.unitares/session-<slot>.json` caches
 3. Do real work
-4. Call `sync_state(...)` once per assistant turn, and after meaningful milestones
+4. Call `sync_state(...)` when there is meaningful agent state to report (usually at most once per assistant turn)
 5. Call `identity()`, `check_working_state()`, and `health_check()` when continuity or governance state looks wrong
 6. Follow the bundled `unitares-governance:dialectic-reasoning` skill and call `dialectic(...)` when you need structured review
 
-With Codex lifecycle hooks configured/trusted, step 4 becomes a baseline rather
-than the only safety net: the Stop hook emits one turn-stop check-in, while
-manual `sync_state(...)` remains the right tool for meaningful milestones and
-agent-authored state. The repository's `commands/` directory is a Claude Code
-surface; Codex plugins do not install those custom slash commands.
+With Codex lifecycle hooks configured/trusted, the Stop hook emits one automatic
+turn-stop interpretation. It is not agent-authored and does not make step 4
+mandatory: manual `sync_state(...)` remains the right tool only for meaningful
+agent-authored state. Lazy onboarding may also add a synthetic bootstrap row,
+which is initialization rather than a real check-in. The repository's
+`commands/` directory is a Claude Code surface; Codex plugins do not install
+those custom slash commands.
 
 The raw tool flow is:
 
 1. First run of a fresh process: `start_session(force_new=true)` (`onboard(...)` is the canonical equivalent)
 2. Fresh process continuing finished prior work: `start_session(force_new=true, parent_agent_id=<saved uuid>, spawn_reason="new_session")`
 3. Same still-running process: do **not** call `start_session` again; use `sync_state(..., client_session_id=<current session id>)`
-4. `sync_state()` once per assistant turn, and after meaningful work (`process_agent_update(...)` is the canonical equivalent)
+4. `sync_state()` when meaningful, usually at most once per assistant turn (`process_agent_update(...)` is the canonical equivalent)
 5. Same live owner / proof-owned rebind only: `identity(agent_uuid=..., continuity_token=..., resume=true)`
 6. `check_working_state()` for read-only state checks (`get_governance_metrics(...)` is the canonical equivalent)
 7. `identity()` if continuity looks wrong
@@ -202,7 +207,8 @@ Typical session:
 
 - start or declare lineage with `start_session(...)`
 - do meaningful work
-- check in once per assistant turn as a baseline
+- make an agent-authored check-in only when meaningful
+- let Stop's separately labeled substrate interpretation describe the turn boundary
 - add a check-in after a milestone, completed step, or decision point
 - diagnose only when needed
 
