@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Executable entry point for the u_run module beside this file."""
+
+from u_run import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -86,6 +86,20 @@ direct unless the runner already manages UNITARES lifecycle state. The model
 should call task-level governance tools; the runner or sidecar should retain
 and inject process identity outside the prompt.
 
+For a plain CLI that has neither lifecycle hooks nor a sidecar client, use the
+bundled process wrapper:
+
+```bash
+scripts/u-run --class goose -- goose run
+```
+
+`u-run` reuses a compatible local sidecar or starts one for the lifetime of the
+child, starts one slot-scoped session, exports the sidecar/server context, and
+forwards termination signals. It emits one exit check-in from observed wall
+time and exit status as `substrate_interpretation`, without supplying agent
+confidence. `--class` is never inferred; when omitted its neutral value is
+`u-run`. See [the adapter guide](./docs/adapters.md#plain-cli-wrapper-u-run).
+
 ## Start Here
 
 If you are using ChatGPT or Codex, start with [CODEX_START.md](./CODEX_START.md).
