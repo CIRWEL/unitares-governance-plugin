@@ -243,7 +243,7 @@ including `0` and `off` kill switches:
 | `UNITARES_AUTO_ONBOARD` | `on` | Let the host Stop hook create a slot-scoped identity before its first turn summary when needed |
 | `UNITARES_FILE_LEASES_ENABLED` | `1` | Enable host edit leases (Claude Edit/Write/MultiEdit; Codex apply_patch) |
 | `UNITARES_FILE_LEASES_REQUIRED` | `0` | Block edits when lease infrastructure is missing/unreachable; truthy values take precedence over `UNITARES_FILE_LEASES_ENABLED=0` |
-| `UNITARES_FILE_LEASE_TTL_S` | `300` | Crash-recovery backstop for a lease not released by PostToolUse |
+| `UNITARES_FILE_LEASE_TTL_S` | `30` | Crash/failure backstop for a lease not released by PostToolUse |
 | `UNITARES_FILE_LEASE_BATCH_TIMEOUT_S` | `3.5` | Total bounded lease work per edit hook (clamped to four seconds) |
 | `UNITARES_MILESTONE_LOCK_TIMEOUT_S` | `2.0` | Maximum wait for the cross-process milestone lock (clamped to four seconds) |
 | `UNITARES_SESSION_CACHE_LOCK_TIMEOUT_S` | `2.0` | Maximum wait for a slot-scoped session-cache transaction (clamped to four seconds) |

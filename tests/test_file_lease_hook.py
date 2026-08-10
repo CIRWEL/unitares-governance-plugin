@@ -481,6 +481,9 @@ def test_codex_patch_acquires_all_paths_in_deterministic_order(tmp_path, monkeyp
     assert rc == 0
     acquired = [body["surface_id"] for path, body, _ in calls if path.endswith("/acquire")]
     assert acquired == [f"file://{tmp_path / 'a.py'}", f"file://{tmp_path / 'z.py'}"]
+    assert {
+        body["ttl_s"] for path, body, _ in calls if path.endswith("/acquire")
+    } == {30}
     state_path = file_lease_hook._state_path(tmp_path, "codex-slot", "call_1")
     state = json.loads(state_path.read_text())
     assert len(state["leases"]) == 2

@@ -87,6 +87,12 @@
         "hooks": [
           {
             "type": "command",
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" post-edit-release --host codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" post-edit-release --host codex",
+            "timeout": 6
+          },
+          {
+            "type": "command",
             "command": "\"${PLUGIN_ROOT}/hooks/run-hook.cmd\" post-edit --host codex",
             "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" post-edit --host codex",
             "timeout": 6

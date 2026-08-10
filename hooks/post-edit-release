@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Synchronous Claude PostToolUse lease cleanup. This is separate from the
-# asynchronous milestone/check-in hook so a later edit cannot race the prior
-# edit's lease release and block its own session.
+# Synchronous PostToolUse lease cleanup for Claude and Codex. This is separate
+# from the milestone/check-in hook so cache or slot failures there cannot skip
+# release, and a later edit cannot race the prior edit's lease cleanup.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

@@ -92,10 +92,13 @@ turn boundary and never releases session-wide lease state because a sibling or
 background edit may still be running under the same `session_id`.
 
 Current Codex invokes PostToolUse only after a successful `apply_patch`, so a
-failed or denied patch is not counted as an edit. Codex exposes no matching
-failure hook today: its pre-acquired lease is released at SessionEnd or by TTL,
-and an immediate in-turn retry can therefore encounter its own still-active
-lease.
+failed or denied patch is not counted as an edit. Successful patches release
+through a dedicated synchronous handler that is independent of the local
+milestone pipeline. Codex exposes no matching failure hook today: a failed
+patch's pre-acquired lease is released at SessionEnd or by the default
+30-second TTL, and an immediate in-turn retry can therefore briefly encounter
+its own still-active lease. Session-wide Stop cleanup remains intentionally
+unsafe because concurrent tools and subagents can share the same `session_id`.
 Denied or failed Codex check-ins are reclaimed by exact session slot at Stop;
 an age-based snapshot prune covers crashes without deleting another live
 workspace session's revision marker.

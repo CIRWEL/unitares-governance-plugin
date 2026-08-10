@@ -107,7 +107,7 @@ source "$1"
         "1.0",
         "0",
         "1",
-        "300",
+        "30",
         "30",
         "0",
         "https://leases.example.test",
@@ -198,6 +198,18 @@ def test_codex_hooks_are_synchronous_and_cover_continuity_path():
     ]
     assert len(edit_handlers) == 1
     assert edit_handlers[0]["timeout"] <= 6
+
+    edit_release_handlers = [
+        handler
+        for event, _group, handler in handlers
+        if event == "PostToolUse"
+        and _invokes(handler, "post-edit-release", host="codex")
+    ]
+    assert len(edit_release_handlers) == 1
+    assert edit_release_handlers[0]["timeout"] <= 6
+    assert "release-edit" not in (ROOT / "hooks" / "post-edit").read_text(
+        encoding="utf-8"
+    )
 
     activity_handlers = [
         (group, handler)
