@@ -6,6 +6,8 @@ import sys
 import threading
 from pathlib import Path
 
+from scripts import file_lease_hook
+from tests.test_file_lease_hook import LeaseHandler
 from tests.test_post_stop_hook import LazyOnboardHandler
 from tests.test_session_start_checkin import RecordingHandler, _ReusableTCPServer
 
@@ -78,6 +80,72 @@ def test_codex_post_edit_is_local_only_and_records_all_patch_paths(tmp_path: Pat
     assert milestone["edit_count"] == 1
     assert milestone["files_touched"] == ["src/a.py", "src/b.py"]
     assert not [call for call in RecordingHandler.calls if call.get("name") == "process_agent_update"]
+
+
+def test_codex_release_handler_does_not_depend_on_session_cache(tmp_path: Path):
+    LeaseHandler.calls = []
+    server = _ReusableTCPServer(("127.0.0.1", 0), LeaseHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    slot = "codex-release-slot"
+    tool_use_id = "call_release_without_cache"
+    state_path = file_lease_hook._state_path(tmp_path, slot, tool_use_id)
+    state_path.parent.mkdir()
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "slot": slot,
+                "workspace": str(tmp_path),
+                "tool_use_id": tool_use_id,
+                "leases": {
+                    f"file://{tmp_path / 'src/a.py'}": {
+                        "lease_id": "lease-a",
+                        "path": "src/a.py",
+                        "surface_id": f"file://{tmp_path / 'src/a.py'}",
+                    }
+                },
+            }
+        )
+    )
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "session_id": slot,
+        "tool_name": "apply_patch",
+        "tool_use_id": tool_use_id,
+        "tool_input": {
+            "command": "*** Begin Patch\n*** Update File: src/a.py\n*** End Patch"
+        },
+    }
+    env = {
+        **_env(tmp_path, 1),
+        "UNITARES_FILE_LEASES_ENABLED": "1",
+        "LEASE_PLANE_BASE_URL": (
+            f"http://127.0.0.1:{server.server_address[1]}"
+        ),
+        "LEASE_PLANE_BEARER_TOKEN": "lease-token",
+        "UNITARES_SECRETS_ENV": "/dev/null",
+    }
+
+    try:
+        result = subprocess.run(
+            [str(PLUGIN_ROOT / "hooks" / "post-edit-release"), "--host", "codex"],
+            cwd=str(tmp_path),
+            env=env,
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+    assert result.returncode == 0, result.stderr
+    assert not state_path.exists()
+    assert [call["path"] for call in LeaseHandler.calls] == ["/v1/lease/release"]
+    assert not list((tmp_path / ".unitares").glob("session-*.json"))
 
 
 def test_codex_first_turn_edit_records_milestone_without_identity_cache(tmp_path: Path):

@@ -23,8 +23,9 @@
 #   UNITARES_WATCHER_ENABLED=1        — opt in to watcher fan-out
 #
 # Claude runs this asynchronously and may auto-check in. Codex runs it
-# synchronously, so its path stops after bounded lease cleanup and a local
-# milestone update. Neither path produces user-visible output on failure.
+# synchronously, so its path stops after a local milestone update. Both hosts
+# release leases through the separate synchronous post-edit-release handler.
+# Neither path produces user-visible output on failure.
 set -uo pipefail
 
 # ---------------------------------------------------------------------------
@@ -128,16 +129,6 @@ if [[ -z "${SLOT}" ]]; then
   printf '[SLOTLESS_SKIP] post-edit: no session_id on stdin; auto-checkin pipeline not run\n' >&2
   _breadcrumb slotless_skip
   exit 0
-fi
-
-# Codex runs this hook synchronously, so it can release here. Claude runs the
-# separate synchronous post-edit-release handler alongside this asynchronous
-# milestone/check-in hook; keeping release out of the async path makes the
-# next Edit wait on deterministic cleanup rather than background work.
-FILE_LEASE_HELPER="${PLUGIN_ROOT}/scripts/file_lease_hook.py"
-if [[ "${HOOK_HOST}" == "codex" && -f "${FILE_LEASE_HELPER}" ]]; then
-  printf '%s' "${HOOK_INPUT}" | python3 "${FILE_LEASE_HELPER}" release-edit \
-    --workspace "${PWD}" --host "${HOOK_HOST}" >/dev/null 2>&1 || true
 fi
 
 # ---------------------------------------------------------------------------

@@ -43,7 +43,7 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8788"
 # only a backstop for the crash-mid-edit window (acquire fired, the session
 # died before release-edit ran). A short TTL means even that orphan self-heals
 # fast via the reaper. Overridable via UNITARES_FILE_LEASE_TTL_S.
-DEFAULT_TTL_S = 300
+DEFAULT_TTL_S = 30
 STATE_VERSION = 1
 DEFAULT_BATCH_TIMEOUT_S = 3.5
 
