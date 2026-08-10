@@ -192,6 +192,41 @@ Use `X-UNITARES-Slot` or top-level `{"slot": "..."}` when one sidecar serves
 multiple clients. Without an explicit slot, the sidecar uses a workspace-derived
 default slot.
 
+### Plain CLI wrapper (`u-run`)
+
+Use `scripts/u-run` when a runtime exposes neither lifecycle hooks nor an HTTP
+client integration point:
+
+```bash
+scripts/u-run --class goose -- goose run --recipe review.yaml
+```
+
+The first `--` separates wrapper options from the child command. `u-run` then:
+
+1. reuses a healthy sidecar for the same workspace and upstream server, or
+   starts one and owns its cleanup;
+2. creates one unique slot (or uses an explicit `--slot`) and calls
+   `/session/start` once, which writes `.unitares/session-<slot>.json`;
+3. exports `UNITARES_SERVER_URL`, `UNITARES_SIDECAR_URL`,
+   `UNITARES_SIDECAR_SLOT`, and `UNITARES_MODEL_TYPE` to the child;
+4. forwards `SIGINT`, `SIGTERM`, and `SIGHUP` to the child process group and
+   preserves the child's shell exit status; and
+5. submits one `/turn/stop` check-in from observed wall time and exit status,
+   always labeled `epistemic_class="substrate_interpretation"` and with no
+   confidence field.
+
+The exit complexity proxy is intentionally small and inspectable: `0.30` base,
+up to `0.35` over the first hour of observed runtime, plus `0.20` for a nonzero
+exit, capped at the same `0.85` ceiling used by hook-derived summaries. It is a
+substrate interpretation of process shape, not a claim about task success or
+the agent's internal state.
+
+Class selection is deliberately explicit. Passing `--class X` uses exactly
+`X`; omitting it uses the neutral literal `u-run`. The wrapper never guesses a
+calibration class from the command name, process name, or working directory.
+Configuration defaults to `UNITARES_SERVER_URL` and `UNITARES_SIDECAR_URL`, or
+to `http://localhost:8767` and `http://127.0.0.1:8768` respectively.
+
 ### Repo Boundary
 
 The sidecar belongs in this repo while it remains a generic client facade. It is
