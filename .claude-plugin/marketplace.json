@@ -9,7 +9,7 @@
     {
       "name": "unitares-governance",
       "description": "Runtime governance for AI agents — agents check in while they work and get a proceed/guide/pause/reject verdict, with drift from each agent's own baseline (EISV) surfaced to operator and agent. Bundles auto-onboard, auto-checkin, dialectic review, and a shared knowledge graph.",
-      "version": "0.4.12",
+      "version": "0.4.13",
       "author": {
         "name": "CIRWEL"
       },
