@@ -15,6 +15,7 @@ source_files:
   - unitares/src/behavioral_assessment.py
   - unitares/src/monitor_decision.py
   - unitares/src/coherence_provenance.py
+  - unitares/src/confidence.py
   - unitares/src/mcp_handlers/core.py
 ---
 
@@ -129,6 +130,7 @@ The system tracks whether your stated confidence matches evidence. Over time thi
 
 - Grounding comes from objective signals: test pass/fail, command exit codes, lint results, file operations. These feed calibration automatically via `auto_ground_truth.py` and the `outcome_event` hook. Human validation is not required for deterministic evidence.
 - Overconfidence is tracked and can lower Integrity / raise uncertainty through the check-in pipeline
+- When an agent omits confidence, the deployed compatibility estimator still gives legacy `C(V_ODE)` 55% of its base weight. Responses expose this as `confidence_reliability.coherence_dependency=ode_control_feedback`; it is known causal debt, not independent confidence evidence. Do not reweight it without prospective outcome calibration because confidence history can feed later entropy penalties.
 
 ## Diagnostics
 
@@ -140,7 +142,7 @@ When the numbers look surprising, do not guess first. Use:
 
 ## What NOT to Do
 
-- **Do not game coherence** by reporting low complexity / high confidence on everything
+- **Do not treat coherence as a score to optimize** — interpret its producer and role
 - **Do not ignore guide verdicts** — they are early warnings before pause/reject
 - **Do not create duplicate discoveries** — always search the knowledge graph first
 - **Do not check in after every trivial action** — it is noise, not signal

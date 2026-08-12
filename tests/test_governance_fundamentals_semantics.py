@@ -44,3 +44,12 @@ def test_hidden_e_and_i_dependency_is_disclosed() -> None:
 
     assert "legacy coherence-level term" in body
     assert "trend of that same legacy controller scalar" in body
+
+
+def test_hidden_confidence_dependency_is_disclosed() -> None:
+    frontmatter, body = _parts()
+
+    assert "unitares/src/confidence.py" in frontmatter
+    assert "55% of its base weight" in body
+    assert "confidence_reliability.coherence_dependency=ode_control_feedback" in body
+    assert "not independent confidence evidence" in body
