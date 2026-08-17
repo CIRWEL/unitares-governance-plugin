@@ -20,7 +20,7 @@ def _parts() -> tuple[str, str]:
 def test_coherence_sources_and_roles_are_explicit() -> None:
     frontmatter, body = _parts()
 
-    assert 'last_verified: "2026-08-11"' in frontmatter
+    assert 'last_verified: "2026-08-17"' in frontmatter
     assert "unitares/src/behavioral_sensor.py" in frontmatter
     assert "unitares/src/coherence_provenance.py" in frontmatter
     assert "`legacy_tanh_v`" in body
