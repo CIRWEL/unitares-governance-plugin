@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# UNITARES Governance Plugin — UserPromptSubmit hook (task-aware KG recall)
+#
+# SessionStart recall is task-blind (repo + branch); the task only exists
+# once the user has typed something. This hook runs the same bounded,
+# read-only, precision-or-silence retrieval with the first substantive
+# prompt's terms — at most one network attempt per session slot. All policy
+# (env gate, slash-command and low-signal skips, marker TTL, stop words)
+# lives in scripts/prompt_recall.py. Failures never block the prompt.
+set -uo pipefail
+
+HOOK_HOST="claude"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --host)
+      [[ $# -ge 2 ]] || exit 0
+      HOOK_HOST="$2"
+      shift 2
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+done
+# Codex has no UserPromptSubmit event; this hook is Claude-only.
+[[ "${HOOK_HOST}" == "claude" ]] || exit 0
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+HELPER="${PLUGIN_ROOT}/scripts/prompt_recall.py"
+[[ -f "${HELPER}" ]] || exit 0
+
+HOOK_INPUT=""
+if [[ ! -t 0 ]]; then
+  HOOK_INPUT=$(cat 2>/dev/null) || true
+fi
+[[ -z "${HOOK_INPUT}" ]] && exit 0
+
+printf '%s' "${HOOK_INPUT}" | python3 "${HELPER}" || true
+exit 0
