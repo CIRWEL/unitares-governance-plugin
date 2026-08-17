@@ -26,7 +26,7 @@ to be present.
 
 | Concern | Claude Code | Codex |
 | --- | --- | --- |
-| Manifest | `hooks/hooks.json` | `hooks/codex-hooks.json` |
+| Manifest | `hooks/claude-hooks.json` | `hooks/codex-hooks.json` |
 | Session-end matcher | Claude wildcard | Codex reason `other` |
 | Edit matcher | `Edit\|Write\|MultiEdit` | canonical `^apply_patch$` |
 | Edit input | scalar `tool_input.file_path` (or legacy `path`) | patch envelope in `tool_input.command` |
