@@ -38,6 +38,14 @@ def test_codex_manifest_declares_host_specific_mcp_and_hooks():
     assert (ROOT / manifest["hooks"]).is_file()
 
 
+def test_claude_hooks_avoid_codex_default_discovery_path():
+    manifest = _load(".claude-plugin/plugin.json")
+
+    assert manifest["hooks"] == "./hooks/claude-hooks.json"
+    assert (ROOT / manifest["hooks"]).is_file()
+    assert not (ROOT / "hooks/hooks.json").exists()
+
+
 def test_codex_mcp_file_uses_concrete_supported_transport():
     config = _load(".codex-mcp.json")
 
@@ -364,7 +372,7 @@ def test_pre_edit_converts_unexpected_required_helper_failure_to_block(
 
 def test_both_hosts_route_identity_calls_through_pretool_generation_guard():
     for relative, host in (
-        ("hooks/hooks.json", "claude"),
+        ("hooks/claude-hooks.json", "claude"),
         ("hooks/codex-hooks.json", "codex"),
     ):
         config = _load(relative)
@@ -384,7 +392,7 @@ def test_both_hosts_route_identity_calls_through_pretool_generation_guard():
 
 
 def test_claude_separates_sync_lease_release_from_async_post_hooks():
-    claude = _load("hooks/hooks.json")
+    claude = _load("hooks/claude-hooks.json")
     codex = _load("hooks/codex-hooks.json")
 
     claude_async_post_handlers = [

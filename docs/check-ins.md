@@ -110,7 +110,7 @@ TTL expires.
 `UNITARES_CHECKINS=off` in the environment suppresses every plugin-emitted
 check-in, identity-free substrate observation, and identity-bound host
 observation. Disable a single trigger by removing its entry from
-`hooks/hooks.json` or `hooks/codex-hooks.json`.
+`hooks/claude-hooks.json` or `hooks/codex-hooks.json`.
 
 ## Diagnosing check-in behavior
 

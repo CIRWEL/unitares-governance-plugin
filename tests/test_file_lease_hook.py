@@ -910,8 +910,10 @@ def test_codex_post_edit_releases_every_patch_path(tmp_path, monkeypatch):
     assert not state_path.exists()
 
 
-def test_hooks_json_wires_pretooluse_edit_guard():
-    config = json.loads((Path(__file__).parent.parent / "hooks" / "hooks.json").read_text())
+def test_claude_hooks_wires_pretooluse_edit_guard():
+    config = json.loads(
+        (Path(__file__).parent.parent / "hooks" / "claude-hooks.json").read_text()
+    )
 
     pre_hooks = config["hooks"]["PreToolUse"]
     assert pre_hooks[0]["matcher"] == "Edit|Write|MultiEdit"

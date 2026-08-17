@@ -8,5 +8,6 @@
   "homepage": "https://github.com/CIRWEL/unitares-governance-plugin",
   "repository": "https://github.com/CIRWEL/unitares-governance-plugin",
   "license": "Apache-2.0",
+  "hooks": "./hooks/claude-hooks.json",
   "keywords": ["governance", "eisv", "runtime-governance", "multi-agent", "dialectic", "coherence"]
 }

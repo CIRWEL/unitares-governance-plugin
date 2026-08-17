@@ -26,7 +26,7 @@ of silently bypassing required leases.
 
 Claude uses `.mcp.json`, including its `UNITARES_SERVER_URL` expansion and an
 optional `Authorization` header sourced from `UNITARES_HTTP_API_TOKEN`, plus the
-async handlers in `hooks/hooks.json`. Current Claude hook payloads scope its
+async handlers in `hooks/claude-hooks.json`. Current Claude hook payloads scope its
 bundled server as `plugin_unitares-governance_unitares-governance`, so a tool
 arrives as
 `mcp__plugin_unitares-governance_unitares-governance__<tool>`. Codex uses the
