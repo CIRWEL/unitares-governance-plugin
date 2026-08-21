@@ -20,7 +20,11 @@ def _parts() -> tuple[str, str]:
 def test_coherence_sources_and_roles_are_explicit() -> None:
     frontmatter, body = _parts()
 
-    assert 'last_verified: "2026-08-17"' in frontmatter
+    # Deliberately a frozen literal, not a derived value: this assertion is a
+    # tripwire. Any edit to the skill fails here until someone re-reads the
+    # coherence contract below and re-stamps on purpose. Bumped 2026-08-21 for
+    # the v2.19.0 margin-semantics correction, which did not touch coherence.
+    assert 'last_verified: "2026-08-21"' in frontmatter
     assert "unitares/src/behavioral_sensor.py" in frontmatter
     assert "unitares/src/coherence_provenance.py" in frontmatter
     assert "`legacy_tanh_v`" in body
