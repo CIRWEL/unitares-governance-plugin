@@ -28,7 +28,7 @@ from _redact import redact_secrets
 
 DEFAULT_SERVER_URL = "http://localhost:8767"
 DEFAULT_LOG_PATH = "~/.unitares/checkins.log"
-DEFAULT_PLUGIN_VERSION = "0.4.13+codex.skills20260817"
+DEFAULT_PLUGIN_VERSION = "0.4.14+codex.skills20260821"
 # process_agent_update can take 5-10s under the anyio-asyncio mitigation
 # paths in governance_core. 20s is the default; synchronous hosts may pass a
 # smaller timeout so the request fits inside their outer hook deadline.
