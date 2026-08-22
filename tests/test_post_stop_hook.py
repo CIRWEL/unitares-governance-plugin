@@ -78,6 +78,9 @@ def test_post_stop_emits_turn_stop_checkin(tmp_path):
         "session_id": slot,
         "stop_hook_active": False,
         "last_assistant_message": "Completed the refactor; all tests pass.",
+        "model": "claude-opus-4-1-20250805",
+        "model_provider": "anthropic",
+        "harness_version": "1.0.83",
     })
 
     try:
@@ -120,6 +123,13 @@ def test_post_stop_emits_turn_stop_checkin(tmp_path):
     assert "Completed the refactor" in text
     assert checkins[0]["arguments"]["epistemic_class"] == "substrate_interpretation"
     assert "continuity_token" not in checkins[0]["arguments"]
+    runtime = checkins[0]["arguments"]["provenance_context"]["runtime_provenance"]
+    assert runtime["model"]["identifier"] == "claude-opus-4-1-20250805"
+    assert runtime["model"]["provider"] == "anthropic"
+    assert runtime["model"]["source"] == "harness_reported"
+    assert runtime["model"]["exact"] is True
+    assert runtime["harness"]["type"] == "claude-code"
+    assert runtime["harness"]["version"] == "1.0.83"
 
 
 def test_post_stop_lazy_onboards_when_cache_missing(tmp_path):

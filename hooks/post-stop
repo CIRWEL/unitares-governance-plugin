@@ -229,6 +229,12 @@ fi
 
 SUMMARY=$(_stop_field summary)
 COMPLEXITY=$(_stop_field complexity)
+MODEL=$(_stop_field model)
+MODEL_PROVIDER=$(_stop_field model_provider)
+MODEL_SOURCE=$(_stop_field model_source)
+HARNESS_TYPE=$(_stop_field harness_type)
+HARNESS_VERSION=$(_stop_field harness_version)
+HARNESS_SOURCE=$(_stop_field harness_source)
 
 # No --confidence: this turn summary is a substrate reading of tool shape, not
 # an agent's belief about its own work. A supplied value mints a tactical
@@ -242,6 +248,12 @@ python3 "${PLUGIN_ROOT}/scripts/checkin.py" \
   --uuid "${UUID}" \
   --slot "${SLOT:-${RAW_SLOT:-}}" \
   --timeout "${CHECKIN_TIMEOUT}" \
+  --model "${MODEL}" \
+  --model-provider "${MODEL_PROVIDER}" \
+  --model-source "${MODEL_SOURCE}" \
+  --harness-type "${HARNESS_TYPE}" \
+  --harness-version "${HARNESS_VERSION}" \
+  --harness-source "${HARNESS_SOURCE}" \
   >/dev/null 2>&1 || true
 
 exit 0

@@ -271,6 +271,91 @@ def test_payload_shape(monkeypatch, tmp_path):
     assert args["metadata"]["event"] == "turn_stop"
     assert args["metadata"]["plugin_version"] == checkin._plugin_version()
     assert "epistemic_class" not in args
+    runtime = args["provenance_context"]["runtime_provenance"]
+    assert runtime["schema"] == "s22.runtime_provenance.v1"
+    assert runtime["model"]["identifier"] is None
+    assert runtime["model"]["source"] == "unavailable"
+    assert runtime["adapter"]["type"] == "unitares-governance-plugin"
+    assert runtime["adapter"]["version"] == checkin._plugin_version()
+    assert runtime["authority"]["is_identity_proof"] is False
+    assert runtime["authority"]["is_verdict_authority"] is False
+    assert runtime["authority"]["is_policy_dispatch_key"] is False
+
+
+def test_payload_carries_exact_hook_reported_model_and_harness(monkeypatch, tmp_path):
+    monkeypatch.setenv("UNITARES_CHECKIN_LOG", str(tmp_path / "cl.log"))
+    captured: dict = {}
+
+    def fake_post(url, payload, timeout=5.0):
+        captured["payload"] = payload
+        return True, 12, None
+
+    with patch("checkin._post_to_governance", side_effect=fake_post):
+        checkin.submit_checkin(
+            event="turn_stop",
+            response_text="done",
+            complexity=0.3,
+            client_session_id="agent-abc1234567",
+            slot="slot-1",
+            plugin_version="0.4.15",
+            model="gpt-5.6-sol",
+            model_provider="openai",
+            model_source="harness_reported",
+            harness_type="codex-cli",
+            harness_version="0.115.0",
+            harness_source="harness_reported",
+        )
+
+    runtime = captured["payload"]["arguments"]["provenance_context"][
+        "runtime_provenance"
+    ]
+    assert runtime["model"] == {
+        "identifier": "gpt-5.6-sol",
+        "provider": "openai",
+        "source": "harness_reported",
+        "provider_source": "harness_reported",
+        "reporting_channel": "host_hook_payload",
+        "exact": True,
+        "verification": "harness_reported_unverified",
+        "missing_reason": None,
+        "provider_missing_reason": None,
+    }
+    assert runtime["harness"]["type"] == "codex-cli"
+    assert runtime["harness"]["version"] == "0.115.0"
+    assert runtime["harness"]["type_source"] == "harness_reported"
+    assert runtime["adapter"]["version"] == "0.4.15"
+
+
+def test_unsafe_model_provenance_is_rejected_without_truncation(monkeypatch, tmp_path):
+    monkeypatch.setenv("UNITARES_CHECKIN_LOG", str(tmp_path / "cl.log"))
+    captured: dict = {}
+    secret = "sk-ant-" + "A" * 40
+
+    def fake_post(url, payload, timeout=5.0):
+        captured["payload"] = payload
+        return True, 12, None
+
+    with patch("checkin._post_to_governance", side_effect=fake_post):
+        checkin.submit_checkin(
+            event="turn_stop",
+            response_text="done",
+            complexity=0.3,
+            client_session_id="agent-abc1234567",
+            slot="slot-1",
+            model=secret,
+            model_source="harness_reported",
+            harness_type="codex-cli",
+        )
+
+    serialized = json.dumps(captured["payload"])
+    runtime = captured["payload"]["arguments"]["provenance_context"][
+        "runtime_provenance"
+    ]
+    assert secret not in serialized
+    assert "sk-ant-" not in serialized
+    assert runtime["model"]["identifier"] is None
+    assert runtime["model"]["source"] == "unavailable"
+    assert runtime["model"]["missing_reason"] == "redacted_sensitive_value"
 
 
 def test_payload_can_label_hook_interpretation(monkeypatch, tmp_path):
