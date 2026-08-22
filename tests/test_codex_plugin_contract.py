@@ -165,6 +165,10 @@ def test_codex_hooks_are_synchronous_and_cover_continuity_path():
     assert all(
         "${PLUGIN_ROOT}" in handler["command"] for _event, _group, handler in handlers
     )
+    assert all(
+        "${PLUGIN_ROOT%/*}" in handler["command"]
+        for _event, _group, handler in handlers
+    )
     assert all("commandWindows" in handler for _event, _group, handler in handlers)
 
     assert any(
@@ -262,6 +266,64 @@ def test_windows_hook_wrapper_propagates_exit_codes_and_fails_required_edits_clo
     for required in ("1", "true", "on", "yes"):
         assert f'"%UNITARES_FILE_LEASES_REQUIRED%"=="{required}"' in wrapper
     assert '"permissionDecision":"deny"' in wrapper
+
+
+def test_codex_stop_hook_recovers_after_plugin_cache_rollover(tmp_path: Path):
+    config = _load("hooks/codex-hooks.json")
+    stop_handler = next(
+        handler
+        for handler in config["hooks"]["Stop"][0]["hooks"]
+        if _invokes(handler, "post-stop", host="codex")
+    )
+
+    stale_version = tmp_path / "plugins" / "cache" / "market" / "plugin" / "old"
+    current_runner = (
+        stale_version.parent / "current" / "hooks" / "run-hook.cmd"
+    )
+    current_runner.parent.mkdir(parents=True)
+    current_runner.write_text(
+        '#!/bin/sh\nprintf \'%s\\n\' "$*"\n',
+        encoding="utf-8",
+    )
+    current_runner.chmod(0o755)
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", stop_handler["command"]],
+        env={
+            **os.environ,
+            "PLUGIN_ROOT": str(stale_version),
+            "PATH": "/usr/bin:/bin",
+        },
+        input="{}",
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "post-stop --host codex\n"
+
+
+def test_unix_hook_wrapper_finds_bash_when_path_omits_bin(tmp_path: Path):
+    hook_dir = tmp_path / "hooks"
+    hook_dir.mkdir()
+    wrapper = hook_dir / "run-hook.cmd"
+    wrapper.write_bytes((ROOT / "hooks" / "run-hook.cmd").read_bytes())
+    target = hook_dir / "probe"
+    target.write_text("printf '{}\\n'\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["/bin/sh", str(wrapper), target.name],
+        env={**os.environ, "PATH": "/usr/bin"},
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "{}\n"
 
 
 def test_pre_edit_blocks_when_required_lease_helper_is_missing(tmp_path: Path):

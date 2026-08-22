@@ -34,7 +34,20 @@ exit /b 0
 CMDBLOCK
 
 # Unix: run the named script directly
+PATH="${PATH:+${PATH}:}/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_NAME="$1"
 shift
-exec bash "${SCRIPT_DIR}/${SCRIPT_NAME}" "$@"
+if [ -x /bin/bash ]; then
+    BASH_BIN=/bin/bash
+elif [ -x /usr/bin/bash ]; then
+    BASH_BIN=/usr/bin/bash
+else
+    BASH_BIN="$(command -v bash 2>/dev/null || true)"
+fi
+if [ -z "$BASH_BIN" ]; then
+    echo "run-hook.cmd: Bash is required to run UNITARES hooks" >&2
+    exit 1
+fi
+exec "$BASH_BIN" "${SCRIPT_DIR}/${SCRIPT_NAME}" "$@"
