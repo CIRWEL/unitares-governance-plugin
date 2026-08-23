@@ -155,6 +155,50 @@ def test_slash_and_low_signal_prompts_skip_without_burning_the_shot(tmp_path):
     assert len(_RecallHandler.calls) == 1
 
 
+def test_system_notification_prompt_skips_without_burning_the_shot(tmp_path):
+    """A background-task notification rides the same UserPromptSubmit event
+    as a real prompt, but its literal task-id/tool-use-id/path tokens are not
+    prose -- they survive _safe_terms() untouched and become a query with no
+    connection to anything relevant. Observed live 2026-08-22: two such
+    notifications in one session both queried on their own id strings."""
+    _RecallHandler.calls = []
+    server = _Server(("127.0.0.1", 0), _RecallHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    notification = (
+        "[SYSTEM NOTIFICATION - NOT USER INPUT]\n"
+        "This is an automated background-task event, NOT a message from the user.\n"
+        "<task-notification>\n"
+        "<task-id>a4e94b35a3c3ee5c5</task-id>\n"
+        "<tool-use-id>toolu_01NTJ1LDNNu2wSVsRePx6c7h</tool-use-id>\n"
+        "<output-file>/private/tmp/claude-501/tasks/a4e94b35a3c3ee5c5.output</output-file>\n"
+        "</task-notification>\n"
+    )
+    try:
+        notified = _run_hook(tmp_path, url, notification, "slot-e")
+        # Check the marker BEFORE the second call writes its own -- both
+        # calls share one slot, so asserting after both would observe the
+        # substantive prompt's write regardless of whether the notification
+        # skip worked.
+        assert notified.returncode == 0
+        assert notified.stdout.strip() == ""
+        assert not _marker(tmp_path, "slot-e").exists()
+
+        real = _run_hook(
+            tmp_path, url, "audit the jetsam ollama governance memory pressure", "slot-e"
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+    # The skip did not write the marker, so the substantive prompt still fired.
+    assert "UNITARES shared-memory leads" in json.loads(real.stdout)["hookSpecificOutput"][
+        "additionalContext"
+    ]
+    assert len(_RecallHandler.calls) == 1
+
+
 def test_env_off_disables_recall(tmp_path):
     result = _run_hook(
         tmp_path,
