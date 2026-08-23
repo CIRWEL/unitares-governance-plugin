@@ -280,6 +280,9 @@ def test_codex_stop_uses_last_assistant_message_without_fake_tool_count(tmp_path
         "turn_id": "turn_1",
         "stop_hook_active": False,
         "last_assistant_message": "Implemented the Codex host contract.",
+        "model": "gpt-5.6-sol",
+        "model_provider": "openai",
+        "harness_version": "0.115.0",
     }
     try:
         result = subprocess.run(
@@ -304,6 +307,12 @@ def test_codex_stop_uses_last_assistant_message_without_fake_tool_count(tmp_path
     assert "tool count unavailable" in summary
     assert "Implemented the Codex host contract" in summary
     assert "0 tool calls" not in summary
+    runtime = checkins[0]["arguments"]["provenance_context"]["runtime_provenance"]
+    assert runtime["model"]["identifier"] == "gpt-5.6-sol"
+    assert runtime["model"]["provider"] == "openai"
+    assert runtime["model"]["exact"] is True
+    assert runtime["harness"]["type"] == "codex-cli"
+    assert runtime["harness"]["version"] == "0.115.0"
     assert not list(
         (tmp_path / ".unitares" / "milestone-snapshots").glob("*.json")
     )

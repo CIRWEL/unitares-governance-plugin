@@ -5,12 +5,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
+try:
+    from _redact import redact_secrets
+except ModuleNotFoundError:  # Imported as ``scripts.stop_hook_event`` in tests.
+    from scripts._redact import redact_secrets
+
 
 SUPPORTED_HOSTS = ("claude", "codex")
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+@-]*$")
 
 
 class StopHookPayloadError(ValueError):
@@ -24,6 +31,12 @@ class StopHookEvent:
     response_text: str
     tool_count: int | None
     tool_names: tuple[str, ...]
+    model: str = ""
+    model_provider: str = ""
+    model_source: str = "unavailable"
+    harness_type: str = ""
+    harness_version: str = ""
+    harness_source: str = "harness_reported"
 
     @property
     def summary(self) -> str:
@@ -73,6 +86,32 @@ def _decode_payload(raw: str | Mapping[str, Any]) -> dict[str, Any]:
     return decoded
 
 
+def _provenance_identifier(
+    payload: Mapping[str, Any], *keys: str, maximum: int = 160
+) -> str:
+    """Return one safe exact identifier, or empty when it cannot be retained.
+
+    Exact identifiers are rejected rather than truncated because truncation can
+    silently merge distinct model cohorts. Sanitization happens before the
+    value reaches a command-line argument in ``hooks/post-stop``.
+    """
+    for key in keys:
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        text = value.strip()
+        if len(text) > maximum:
+            return ""
+        if any(ord(char) < 32 or ord(char) == 127 for char in text):
+            return ""
+        if "://" in text or redact_secrets(text) != text:
+            return ""
+        if not _SAFE_IDENTIFIER_RE.fullmatch(text):
+            return ""
+        return text
+    return ""
+
+
 def normalize_claude(payload: Mapping[str, Any]) -> StopHookEvent:
     """Normalize current Claude Stop input, with a legacy payload fallback."""
     if "last_assistant_message" in payload:
@@ -100,12 +139,22 @@ def normalize_claude(payload: Mapping[str, Any]) -> StopHookEvent:
         )
     else:
         raise StopHookPayloadError("legacy Claude Stop tool_calls must be a list")
+    model = _provenance_identifier(payload, "model")
     return StopHookEvent(
         host="claude",
         session_id=str(payload.get("session_id") or "").strip(),
         response_text=message[:512],
         tool_count=count,
         tool_names=names,
+        model=model,
+        model_provider=_provenance_identifier(
+            payload, "model_provider", "provider", maximum=80
+        ),
+        model_source="harness_reported" if model else "unavailable",
+        harness_type="claude-code",
+        harness_version=_provenance_identifier(
+            payload, "harness_version", "client_version", "version", maximum=80
+        ),
     )
 
 
@@ -113,12 +162,22 @@ def normalize_codex(payload: Mapping[str, Any]) -> StopHookEvent:
     message = payload.get("last_assistant_message") or ""
     if not isinstance(message, str):
         raise StopHookPayloadError("Codex Stop payload last_assistant_message must be a string or null")
+    model = _provenance_identifier(payload, "model")
     return StopHookEvent(
         host="codex",
         session_id=str(payload.get("session_id") or "").strip(),
         response_text=message[:512],
         tool_count=None,
         tool_names=(),
+        model=model,
+        model_provider=_provenance_identifier(
+            payload, "model_provider", "provider", maximum=80
+        ),
+        model_source="harness_reported" if model else "unavailable",
+        harness_type="codex-cli",
+        harness_version=_provenance_identifier(
+            payload, "harness_version", "client_version", "version", maximum=80
+        ),
     )
 
 

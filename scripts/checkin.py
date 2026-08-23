@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -34,6 +35,25 @@ DEFAULT_PLUGIN_VERSION = "0.4.14+codex.skills20260821"
 # smaller timeout so the request fits inside their outer hook deadline.
 POST_TIMEOUT_SEC = 20.0
 RESPONSE_TEXT_MAX = 512
+RUNTIME_PROVENANCE_SCHEMA = "s22.runtime_provenance.v1"
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+@-]*$")
+_MODEL_SOURCES = frozenset(
+    {
+        "provider_reported",
+        "harness_reported",
+        "caller_declared",
+        "transport_inferred",
+        "unavailable",
+    }
+)
+_HARNESS_SOURCES = frozenset(
+    {
+        "harness_reported",
+        "caller_declared",
+        "transport_user_agent",
+        "unavailable",
+    }
+)
 
 
 def _plugin_version() -> str:
@@ -54,6 +74,132 @@ def _plugin_version() -> str:
 
 def _is_killed() -> bool:
     return os.environ.get("UNITARES_CHECKINS", "on").strip().lower() == "off"
+
+
+def _safe_identifier(value: object, *, maximum: int) -> tuple[Optional[str], str]:
+    """Sanitize an attribution identifier without changing its cohort key."""
+    if value is None:
+        return None, "not_exposed"
+    if not isinstance(value, str):
+        return None, "invalid_type"
+    text = value.strip()
+    if not text:
+        return None, "not_exposed"
+    if len(text) > maximum:
+        return None, "value_too_long"
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        return None, "control_character_rejected"
+    if "://" in text or redact_secrets(text) != text:
+        return None, "redacted_sensitive_value"
+    if not _SAFE_IDENTIFIER_RE.fullmatch(text):
+        return None, "invalid_identifier_format"
+    return text, "available"
+
+
+def _source(value: object, *, allowed: frozenset[str], available: bool) -> str:
+    if not available:
+        return "unavailable"
+    if isinstance(value, str) and value.strip().lower() in allowed:
+        return value.strip().lower()
+    return "caller_declared"
+
+
+def _verification(source: str) -> str:
+    return {
+        "provider_reported": "provider_reported_unverified",
+        "harness_reported": "harness_reported_unverified",
+        "caller_declared": "unverified",
+        "transport_inferred": "inferred_family_only",
+        "transport_user_agent": "transport_observed",
+        "unavailable": "unavailable",
+    }.get(source, "unverified")
+
+
+def _runtime_provenance(
+    *,
+    model: str,
+    model_provider: str,
+    model_source: str,
+    harness_type: str,
+    harness_version: str,
+    harness_source: str,
+    plugin_version: str,
+) -> dict:
+    """Build descriptive, non-authoritative runtime provenance for one write."""
+    safe_model, model_reason = _safe_identifier(model, maximum=160)
+    safe_provider, provider_reason = _safe_identifier(model_provider, maximum=80)
+    safe_harness, harness_reason = _safe_identifier(harness_type, maximum=80)
+    safe_harness_version, harness_version_reason = _safe_identifier(
+        harness_version, maximum=80
+    )
+    safe_plugin_version, plugin_version_reason = _safe_identifier(
+        plugin_version, maximum=80
+    )
+
+    model_source_value = _source(
+        model_source, allowed=_MODEL_SOURCES, available=safe_model is not None
+    )
+    harness_source_value = _source(
+        harness_source,
+        allowed=_HARNESS_SOURCES,
+        available=safe_harness is not None,
+    )
+    harness_version_source = _source(
+        harness_source,
+        allowed=_HARNESS_SOURCES,
+        available=safe_harness_version is not None,
+    )
+    provider_source = (
+        model_source_value if safe_provider is not None else "unavailable"
+    )
+    exact = bool(
+        safe_model
+        and model_source_value in {"provider_reported", "harness_reported"}
+    )
+
+    return {
+        "schema": RUNTIME_PROVENANCE_SCHEMA,
+        "record_status": "captured",
+        "model": {
+            "identifier": safe_model,
+            "provider": safe_provider,
+            "source": model_source_value,
+            "provider_source": provider_source,
+            "reporting_channel": "host_hook_payload" if safe_model else "none",
+            "exact": exact,
+            "verification": _verification(model_source_value),
+            "missing_reason": None if safe_model else model_reason,
+            "provider_missing_reason": None if safe_provider else provider_reason,
+        },
+        "harness": {
+            "type": safe_harness,
+            "version": safe_harness_version,
+            "type_source": harness_source_value,
+            "version_source": harness_version_source,
+            "type_verification": _verification(harness_source_value),
+            "version_verification": _verification(harness_version_source),
+            "missing_reason": None if safe_harness else harness_reason,
+            "version_missing_reason": (
+                None if safe_harness_version else harness_version_reason
+            ),
+        },
+        "adapter": {
+            "type": "unitares-governance-plugin",
+            "version": safe_plugin_version,
+            "source": "caller_declared",
+            "verification": "unverified",
+            "missing_reason": None,
+            "version_missing_reason": (
+                None if safe_plugin_version else plugin_version_reason
+            ),
+        },
+        "authority": {
+            "role": "descriptive_context",
+            "is_identity_proof": False,
+            "is_verdict_authority": False,
+            "is_policy_dispatch_key": False,
+        },
+    }
 
 
 def _log_path() -> Path:
@@ -195,6 +341,12 @@ def submit_checkin(
     plugin_version: Optional[str] = None,
     epistemic_class: Optional[str] = None,
     timeout: Optional[float] = None,
+    model: str = "",
+    model_provider: str = "",
+    model_source: str = "unavailable",
+    harness_type: str = "",
+    harness_version: str = "",
+    harness_source: str = "unavailable",
 ) -> str:
     """Send one check-in. Returns a status string suitable for logging."""
     if _is_killed():
@@ -203,6 +355,7 @@ def submit_checkin(
     try:
         safe_text = redact_secrets(response_text)[:RESPONSE_TEXT_MAX]
         url = server_url or os.environ.get("UNITARES_SERVER_URL", DEFAULT_SERVER_URL)
+        resolved_plugin_version = plugin_version or _plugin_version()
         arguments = {
             "response_text": safe_text,
             "complexity": max(0.0, min(1.0, float(complexity))),
@@ -210,7 +363,18 @@ def submit_checkin(
             "metadata": {
                 "source": "plugin_hook",
                 "event": event,
-                "plugin_version": plugin_version or _plugin_version(),
+                "plugin_version": resolved_plugin_version,
+            },
+            "provenance_context": {
+                "runtime_provenance": _runtime_provenance(
+                    model=model,
+                    model_provider=model_provider,
+                    model_source=model_source,
+                    harness_type=harness_type,
+                    harness_version=harness_version,
+                    harness_source=harness_source,
+                    plugin_version=resolved_plugin_version,
+                )
             },
         }
         # `confidence` is a belief the agent holds, and a hook holds none. When
@@ -279,6 +443,12 @@ def _cli() -> int:
     p.add_argument("--uuid", default="")
     p.add_argument("--server-url", default=None)
     p.add_argument("--plugin-version", default=None)
+    p.add_argument("--model", default="")
+    p.add_argument("--model-provider", default="")
+    p.add_argument("--model-source", default="unavailable")
+    p.add_argument("--harness-type", default="")
+    p.add_argument("--harness-version", default="")
+    p.add_argument("--harness-source", default="unavailable")
     p.add_argument(
         "--timeout",
         type=float,
@@ -316,6 +486,12 @@ def _cli() -> int:
         plugin_version=args.plugin_version,
         epistemic_class=args.epistemic_class,
         timeout=args.timeout,
+        model=args.model,
+        model_provider=args.model_provider,
+        model_source=args.model_source,
+        harness_type=args.harness_type,
+        harness_version=args.harness_version,
+        harness_source=args.harness_source,
     )
     if status == "sent":
         return 0
