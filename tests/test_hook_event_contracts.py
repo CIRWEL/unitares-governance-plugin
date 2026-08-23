@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from scripts import edit_hook_event, stop_hook_event
@@ -189,3 +191,39 @@ def test_codex_stop_contract_reads_last_message_without_inventing_tool_count():
     assert event.complexity == 0.3
     assert "tool count unavailable" in event.summary
     assert "Implemented and verified" in event.summary
+
+
+def test_stop_contract_captures_safe_model_harness_provenance_without_guessing():
+    event = stop_hook_event.normalize_stop_hook(
+        {
+            "session_id": "codex-slot",
+            "last_assistant_message": "Done.",
+            "model": "gpt-5.6-sol",
+            "model_provider": "openai",
+            "harness_version": "0.115.0",
+        },
+        host="codex",
+    )
+
+    assert event.model == "gpt-5.6-sol"
+    assert event.model_provider == "openai"
+    assert event.model_source == "harness_reported"
+    assert event.harness_type == "codex-cli"
+    assert event.harness_version == "0.115.0"
+    assert event.harness_source == "harness_reported"
+
+
+def test_stop_contract_rejects_secret_shaped_model_before_hook_argv():
+    secret = "sk-ant-" + "A" * 40
+    event = stop_hook_event.normalize_stop_hook(
+        {
+            "session_id": "claude-slot",
+            "last_assistant_message": "Done.",
+            "model": secret,
+        },
+        host="claude",
+    )
+
+    assert event.model == ""
+    assert event.model_source == "unavailable"
+    assert secret not in json.dumps(event.to_json_dict())
