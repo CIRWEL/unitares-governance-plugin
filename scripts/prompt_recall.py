@@ -131,6 +131,17 @@ def main(argv: list[str] | None = None) -> int:
     prompt = str(payload.get("prompt") or "")
     if not prompt.strip() or prompt.lstrip().startswith("/"):
         return 0
+    # A harness-injected background-task notification rides the same
+    # UserPromptSubmit event as a real prompt, but is not user-typed prose --
+    # its literal task-id/tool-use-id/path tokens survive _safe_terms()
+    # untouched and dominate the query, producing leads with no connection to
+    # anything relevant. Observed 2026-08-22: two such notifications in one
+    # session both queried on their own id strings. Recognized by the
+    # harness's own stable marker, the same way a slash-command is
+    # recognized by its leading "/" above -- skip without burning the shot,
+    # so the next real prompt in the slot still gets one.
+    if prompt.lstrip().startswith("[SYSTEM NOTIFICATION"):
+        return 0
 
     cwd = Path(str(payload.get("cwd") or "") or os.getcwd())
     session_id = str(payload.get("session_id") or "")
