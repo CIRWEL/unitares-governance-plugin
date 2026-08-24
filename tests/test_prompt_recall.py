@@ -91,7 +91,21 @@ def _marker(tmp_path: Path, session_id: str) -> Path:
     return tmp_path / ".unitares" / f"prompt-kg-recall-{session_id}.json"
 
 
-def test_first_substantive_prompt_injects_leads_once_per_slot(tmp_path):
+def test_default_mode_injects_no_content_and_makes_no_request(tmp_path):
+    _RecallHandler.calls = []
+    result = _run_hook(
+        tmp_path,
+        "http://127.0.0.1:9",
+        "investigate coherence gate shadow soak results",
+        "slot-default",
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == ""
+    assert _RecallHandler.calls == []
+    assert not _marker(tmp_path, "slot-default").exists()
+
+
+def test_content_opt_in_injects_leads_once_per_slot(tmp_path):
     _RecallHandler.calls = []
     server = _Server(("127.0.0.1", 0), _RecallHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -99,10 +113,18 @@ def test_first_substantive_prompt_injects_leads_once_per_slot(tmp_path):
     url = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         first = _run_hook(
-            tmp_path, url, "investigate coherence gate shadow soak results", "slot-a"
+            tmp_path,
+            url,
+            "investigate coherence gate shadow soak results",
+            "slot-a",
+            extra_env={"UNITARES_HOOK_KG_RECALL": "content"},
         )
         second = _run_hook(
-            tmp_path, url, "now check the lease plane starvation angle", "slot-a"
+            tmp_path,
+            url,
+            "now check the lease plane starvation angle",
+            "slot-a",
+            extra_env={"UNITARES_HOOK_KG_RECALL": "content"},
         )
     finally:
         server.shutdown()
@@ -136,10 +158,17 @@ def test_slash_and_low_signal_prompts_skip_without_burning_the_shot(tmp_path):
     thread.start()
     url = f"http://127.0.0.1:{server.server_address[1]}"
     try:
-        slash = _run_hook(tmp_path, url, "/diagnose everything now please", "slot-b")
-        low = _run_hook(tmp_path, url, "proceed", "slot-b")
+        recall_env = {"UNITARES_HOOK_KG_RECALL": "content"}
+        slash = _run_hook(
+            tmp_path, url, "/diagnose everything now please", "slot-b", recall_env
+        )
+        low = _run_hook(tmp_path, url, "proceed", "slot-b", recall_env)
         real = _run_hook(
-            tmp_path, url, "audit the jetsam ollama governance memory pressure", "slot-b"
+            tmp_path,
+            url,
+            "audit the jetsam ollama governance memory pressure",
+            "slot-b",
+            recall_env,
         )
     finally:
         server.shutdown()
@@ -176,7 +205,8 @@ def test_system_notification_prompt_skips_without_burning_the_shot(tmp_path):
         "</task-notification>\n"
     )
     try:
-        notified = _run_hook(tmp_path, url, notification, "slot-e")
+        recall_env = {"UNITARES_HOOK_KG_RECALL": "content"}
+        notified = _run_hook(tmp_path, url, notification, "slot-e", recall_env)
         # Check the marker BEFORE the second call writes its own -- both
         # calls share one slot, so asserting after both would observe the
         # substantive prompt's write regardless of whether the notification
@@ -186,7 +216,11 @@ def test_system_notification_prompt_skips_without_burning_the_shot(tmp_path):
         assert not _marker(tmp_path, "slot-e").exists()
 
         real = _run_hook(
-            tmp_path, url, "audit the jetsam ollama governance memory pressure", "slot-e"
+            tmp_path,
+            url,
+            "audit the jetsam ollama governance memory pressure",
+            "slot-e",
+            recall_env,
         )
     finally:
         server.shutdown()
@@ -218,6 +252,7 @@ def test_unreachable_server_is_silent_and_burns_the_shot(tmp_path):
         "http://127.0.0.1:9",
         "investigate coherence gate shadow soak results",
         "slot-d",
+        extra_env={"UNITARES_HOOK_KG_RECALL": "content"},
     )
     assert result.returncode == 0
     assert result.stdout.strip() == ""

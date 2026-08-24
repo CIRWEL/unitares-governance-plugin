@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-shot task-aware KG recall on the first substantive user prompt.
+"""Optional one-shot task-aware KG recall on a substantive user prompt.
 
 SessionStart recall is task-blind: its query is repo + branch, and from a
 non-repo working directory it degenerates to a near-constant string. The
@@ -8,7 +8,10 @@ the same bounded, read-only, precision-or-silence retrieval with the
 prompt's content terms — at most one network attempt per session slot.
 
 Gating (cheap checks first, no network):
-  - UNITARES_HOOK_KG_RECALL off disables this hook and SessionStart recall alike.
+  - Automatic content recall is opt-in. UNITARES_HOOK_KG_RECALL must be
+    `content` (or a legacy truthy alias: on/1/true/yes).
+  - The default `hint` mode advertises pull-based search at SessionStart but
+    injects no findings and makes no request from this hook.
   - Slash-command prompts and prompts with fewer than MIN_TASK_TERMS content
     terms are skipped WITHOUT writing the marker, so a later substantive
     prompt still gets its shot.
@@ -32,6 +35,7 @@ import kg_recall
 
 MIN_TASK_TERMS = 3
 DEFAULT_TTL_S = 3600.0
+CONTENT_RECALL_MODES = frozenset({"1", "content", "on", "true", "yes"})
 
 # _safe_terms() was built for repo/branch text, which carries no prose. A
 # prompt is prose, and with operator=OR every stop word matches broadly, so
@@ -117,8 +121,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ttl", type=float, default=None)
     args = parser.parse_args(argv)
 
-    mode = (os.environ.get("UNITARES_HOOK_KG_RECALL") or "on").strip().lower()
-    if mode in {"0", "off", "false", "no"}:
+    mode = (os.environ.get("UNITARES_HOOK_KG_RECALL") or "hint").strip().lower()
+    if mode not in CONTENT_RECALL_MODES:
         return 0
 
     try:

@@ -140,7 +140,9 @@ class _Server(socketserver.TCPServer):
     allow_reuse_address = True
 
 
-def _run_session_start(tmp_path: Path, server_url: str, session_id: str):
+def _run_session_start(
+    tmp_path: Path, server_url: str, session_id: str, extra_env=None
+):
     env = {
         "PATH": "/usr/bin:/bin:/usr/local/bin",
         "HOME": str(tmp_path),
@@ -150,6 +152,8 @@ def _run_session_start(tmp_path: Path, server_url: str, session_id: str):
         "UNITARES_HOOK_SKIP_WORKSPACE_BRIEFING": "1",
         "UNITARES_SESSION_START_LOG": str(tmp_path / "session-start.log"),
     }
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         [str(PLUGIN_ROOT / "hooks" / "session-start"), "--host", "claude"],
         cwd=tmp_path,
@@ -162,15 +166,38 @@ def _run_session_start(tmp_path: Path, server_url: str, session_id: str):
     )
 
 
-def test_session_start_injects_once_per_slot_ttl(tmp_path):
+def test_session_start_defaults_to_capability_hint_without_search(tmp_path):
     _RecallHandler.calls = []
     server = _Server(("127.0.0.1", 0), _RecallHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     url = f"http://127.0.0.1:{server.server_address[1]}"
     try:
-        first = _run_session_start(tmp_path, url, "kg-slot-1")
-        second = _run_session_start(tmp_path, url, "kg-slot-1")
+        first = _run_session_start(tmp_path, url, "kg-hint-slot")
+        second = _run_session_start(tmp_path, url, "kg-hint-slot")
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+    first_context = json.loads(first.stdout)["hookSpecificOutput"]["additionalContext"]
+    second_context = json.loads(second.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert first.returncode == 0
+    assert "search_shared_memory" in first_context
+    assert "No KG findings are injected automatically" in first_context
+    assert "search_shared_memory" not in second_context
+    assert _RecallHandler.calls == []
+
+
+def test_session_start_content_opt_in_injects_once_per_slot_ttl(tmp_path):
+    _RecallHandler.calls = []
+    server = _Server(("127.0.0.1", 0), _RecallHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        recall_env = {"UNITARES_HOOK_KG_RECALL": "content"}
+        first = _run_session_start(tmp_path, url, "kg-slot-1", recall_env)
+        second = _run_session_start(tmp_path, url, "kg-slot-1", recall_env)
     finally:
         server.shutdown()
         thread.join(timeout=2)
