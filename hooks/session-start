@@ -658,17 +658,17 @@ ${SKILL_POINTER}"
 fi
 
 # ---------------------------------------------------------------------------
-# Shared-memory capability hint and optional bounded recall
+# Optional shared-memory capability hint and bounded recall
 #
-# Default mode is pull-based: advertise `search_shared_memory` once without a
-# network request or finding content. Operators can explicitly opt into the
-# legacy read-only injection with UNITARES_HOOK_KG_RECALL=content (truthy
-# aliases remain supported). That helper derives a conservative repo + branch
-# query, suppresses low-confidence semantic-only results, and excludes hollow
-# memory mirrors. Failures and timeouts are precision-or-silence.
+# Default mode is fully silent and pull-based. Operators can opt into one
+# capability hint with UNITARES_HOOK_KG_RECALL=hint, or the legacy read-only
+# injection with UNITARES_HOOK_KG_RECALL=content (truthy aliases remain
+# supported). That helper derives a conservative repo + branch query,
+# suppresses low-confidence semantic-only results, and excludes hollow memory
+# mirrors. Failures, timeouts, and unknown modes are precision-or-silence.
 # ---------------------------------------------------------------------------
 KG_RECALL_CONTEXT=""
-KG_RECALL_MODE="$(printf '%s' "${UNITARES_HOOK_KG_RECALL:-hint}" | tr '[:upper:]' '[:lower:]')"
+KG_RECALL_MODE="$(printf '%s' "${UNITARES_HOOK_KG_RECALL:-off}" | tr '[:upper:]' '[:lower:]')"
 KG_RECALL_HELPER="${PLUGIN_ROOT}/scripts/kg_recall.py"
 if [[ "${KG_RECALL_ALREADY_SHOWN}" != "1" ]]; then
   case "${KG_RECALL_MODE}" in
@@ -697,7 +697,7 @@ if [[ "${KG_RECALL_ALREADY_SHOWN}" != "1" ]]; then
           2>>"${HEALTH_LOG}" || true)
       fi
       ;;
-    *)
+    hint)
       if [[ -n "${HEALTH_STATUS}" ]]; then
         KG_RECALL_CONTEXT='UNITARES shared memory is available on demand via `search_shared_memory(query=...)`. Query it when prior federation state matters; inspect a finding before relying on it. No KG findings are injected automatically.'
         if [[ -n "${KG_RECALL_MARKER}" ]]; then
@@ -705,13 +705,15 @@ if [[ "${KG_RECALL_ALREADY_SHOWN}" != "1" ]]; then
         fi
       fi
       ;;
+    *)
+      ;;
   esac
 fi
 if [[ -n "${KG_RECALL_CONTEXT}" ]]; then
   CONTEXT="${CONTEXT}
 
 ${KG_RECALL_CONTEXT}"
-  # Content mode already marks its attempt above; this covers the default hint.
+  # Content mode already marks its attempt above; this covers explicit hint mode.
   if [[ -n "${KG_RECALL_MARKER}" ]]; then
     SHOULD_WRITE_KG_RECALL_MARKER=1
   fi
