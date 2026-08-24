@@ -181,6 +181,10 @@ def test_codex_hooks_are_synchronous_and_cover_continuity_path():
         event == "SessionStart" and _invokes(handler, "runtime-start", host="codex")
         for event, _, handler in handlers
     )
+    # Activity observations now start the bounded worker after completed tools.
+    # Keeping the former SessionStart entrypoint executable in hooks/ makes it
+    # look live even though no host dispatches it.
+    assert not (ROOT / "hooks" / "runtime-start").exists()
     assert any(
         _invokes(handler, "session-end", host="codex") for _, _, handler in handlers
     )
