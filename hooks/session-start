@@ -261,9 +261,10 @@ if [[ -n "${NUDGE_MARKER}" && ! -f "${WORKSPACE_CACHE}" && -f "${NUDGE_MARKER}" 
   NUDGE_ALREADY_SHOWN=1
 fi
 
-# SessionStart can fire repeatedly on resume/compact. Shared-memory context is
-# useful once per work interval, not once per hook event; a slot-scoped marker
-# bounds read traffic without creating governance identity or state.
+# SessionStart can fire repeatedly on resume/compact. The shared-memory
+# capability hint (or explicitly opted-in content) is useful once per work
+# interval, not once per hook event; a slot-scoped marker bounds delivery and
+# read traffic without creating governance identity or state.
 KG_RECALL_TTL_SECS="${UNITARES_HOOK_KG_RECALL_TTL_S:-3600}"
 if [[ -n "${KG_RECALL_MARKER}" && -f "${KG_RECALL_MARKER}" ]]; then
   KG_RECALL_MARKER_MTIME=$(python3 - "${KG_RECALL_MARKER}" <<'PY' 2>/dev/null || echo 0
@@ -657,43 +658,60 @@ ${SKILL_POINTER}"
 fi
 
 # ---------------------------------------------------------------------------
-# Bounded shared-memory recall
+# Shared-memory capability hint and optional bounded recall
 #
-# This is a read-only `knowledge(action="search")` call. It does not onboard,
-# resume, check in, or write KG state. The helper derives a conservative query
-# from repo + branch, suppresses low-confidence semantic-only results, and
-# excludes summary-only memory mirrors that lack substantive `details`.
-# Failures and timeouts are precision-or-silence: SessionStart still ships.
+# Default mode is pull-based: advertise `search_shared_memory` once without a
+# network request or finding content. Operators can explicitly opt into the
+# legacy read-only injection with UNITARES_HOOK_KG_RECALL=content (truthy
+# aliases remain supported). That helper derives a conservative repo + branch
+# query, suppresses low-confidence semantic-only results, and excludes hollow
+# memory mirrors. Failures and timeouts are precision-or-silence.
 # ---------------------------------------------------------------------------
 KG_RECALL_CONTEXT=""
-KG_RECALL_MODE="$(printf '%s' "${UNITARES_HOOK_KG_RECALL:-on}" | tr '[:upper:]' '[:lower:]')"
+KG_RECALL_MODE="$(printf '%s' "${UNITARES_HOOK_KG_RECALL:-hint}" | tr '[:upper:]' '[:lower:]')"
 KG_RECALL_HELPER="${PLUGIN_ROOT}/scripts/kg_recall.py"
-if [[ -n "${HEALTH_STATUS}" \
-      && "${KG_RECALL_ALREADY_SHOWN}" != "1" \
-      && "${KG_RECALL_MODE}" != "0" \
-      && "${KG_RECALL_MODE}" != "off" \
-      && "${KG_RECALL_MODE}" != "false" \
-      && "${KG_RECALL_MODE}" != "no" \
-      && -f "${KG_RECALL_HELPER}" ]]; then
-  KG_RECALL_ARGS=(
-    --workspace "${PWD}"
-    --server-url "${SERVER_URL}"
-    --limit "${UNITARES_HOOK_KG_RECALL_LIMIT:-3}"
-    --timeout "${UNITARES_HOOK_KG_RECALL_TIMEOUT_S:-2.0}"
-    --format-context
-  )
-  # A real orchestrator-provisioned anchor is safe attribution proof. A bare
-  # environment value is not; only pass it under the existing anchored gate.
-  if [[ "${ANCHOR_RESUME_ENABLED}" == "1" ]]; then
-    KG_RECALL_ARGS+=(--client-session-id "${UNITARES_CLIENT_SESSION_ID}")
-  fi
-  KG_RECALL_CONTEXT=$(python3 "${KG_RECALL_HELPER}" "${KG_RECALL_ARGS[@]}" \
-    2>>"${HEALTH_LOG}" || true)
+if [[ "${KG_RECALL_ALREADY_SHOWN}" != "1" ]]; then
+  case "${KG_RECALL_MODE}" in
+    0|off|false|no|none|disabled)
+      ;;
+    1|content|on|true|yes)
+      if [[ -n "${HEALTH_STATUS}" && -f "${KG_RECALL_HELPER}" ]]; then
+        KG_RECALL_ARGS=(
+          --workspace "${PWD}"
+          --server-url "${SERVER_URL}"
+          --limit "${UNITARES_HOOK_KG_RECALL_LIMIT:-3}"
+          --timeout "${UNITARES_HOOK_KG_RECALL_TIMEOUT_S:-2.0}"
+          --format-context
+        )
+        # A real orchestrator-provisioned anchor is safe attribution proof. A
+        # bare environment value is not; only pass it under the existing gate.
+        if [[ "${ANCHOR_RESUME_ENABLED}" == "1" ]]; then
+          KG_RECALL_ARGS+=(--client-session-id "${UNITARES_CLIENT_SESSION_ID}")
+        fi
+        # One attempt per slot even when retrieval returns no usable leads.
+        # Repeated resumes must not turn a precision-or-silence miss into churn.
+        if [[ -n "${KG_RECALL_MARKER}" ]]; then
+          SHOULD_WRITE_KG_RECALL_MARKER=1
+        fi
+        KG_RECALL_CONTEXT=$(python3 "${KG_RECALL_HELPER}" "${KG_RECALL_ARGS[@]}" \
+          2>>"${HEALTH_LOG}" || true)
+      fi
+      ;;
+    *)
+      if [[ -n "${HEALTH_STATUS}" ]]; then
+        KG_RECALL_CONTEXT='UNITARES shared memory is available on demand via `search_shared_memory(query=...)`. Query it when prior federation state matters; inspect a finding before relying on it. No KG findings are injected automatically.'
+        if [[ -n "${KG_RECALL_MARKER}" ]]; then
+          SHOULD_WRITE_KG_RECALL_MARKER=1
+        fi
+      fi
+      ;;
+  esac
 fi
 if [[ -n "${KG_RECALL_CONTEXT}" ]]; then
   CONTEXT="${CONTEXT}
 
 ${KG_RECALL_CONTEXT}"
+  # Content mode already marks its attempt above; this covers the default hint.
   if [[ -n "${KG_RECALL_MARKER}" ]]; then
     SHOULD_WRITE_KG_RECALL_MARKER=1
   fi
