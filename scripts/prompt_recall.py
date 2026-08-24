@@ -10,8 +10,8 @@ prompt's content terms — at most one network attempt per session slot.
 Gating (cheap checks first, no network):
   - Automatic content recall is opt-in. UNITARES_HOOK_KG_RECALL must be
     `content` (or a legacy truthy alias: on/1/true/yes).
-  - The default `hint` mode advertises pull-based search at SessionStart but
-    injects no findings and makes no request from this hook.
+  - The default `off` mode is silent. `hint` can explicitly advertise
+    pull-based search at SessionStart without making a request from this hook.
   - Slash-command prompts and prompts with fewer than MIN_TASK_TERMS content
     terms are skipped WITHOUT writing the marker, so a later substantive
     prompt still gets its shot.
@@ -121,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ttl", type=float, default=None)
     args = parser.parse_args(argv)
 
-    mode = (os.environ.get("UNITARES_HOOK_KG_RECALL") or "hint").strip().lower()
+    mode = (os.environ.get("UNITARES_HOOK_KG_RECALL") or "off").strip().lower()
     if mode not in CONTENT_RECALL_MODES:
         return 0
 

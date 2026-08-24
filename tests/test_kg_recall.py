@@ -166,15 +166,38 @@ def _run_session_start(
     )
 
 
-def test_session_start_defaults_to_capability_hint_without_search(tmp_path):
+def test_session_start_defaults_to_silence_without_search(tmp_path):
     _RecallHandler.calls = []
     server = _Server(("127.0.0.1", 0), _RecallHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     url = f"http://127.0.0.1:{server.server_address[1]}"
     try:
-        first = _run_session_start(tmp_path, url, "kg-hint-slot")
-        second = _run_session_start(tmp_path, url, "kg-hint-slot")
+        result = _run_session_start(tmp_path, url, "kg-default-slot")
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+    context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert result.returncode == 0
+    assert "search_shared_memory" not in context
+    marker = (
+        tmp_path / ".unitares" / "session-start-kg-recall-kg-default-slot.json"
+    )
+    assert not marker.exists()
+    assert _RecallHandler.calls == []
+
+
+def test_session_start_explicit_hint_injects_no_findings_or_search(tmp_path):
+    _RecallHandler.calls = []
+    server = _Server(("127.0.0.1", 0), _RecallHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        recall_env = {"UNITARES_HOOK_KG_RECALL": "hint"}
+        first = _run_session_start(tmp_path, url, "kg-hint-slot", recall_env)
+        second = _run_session_start(tmp_path, url, "kg-hint-slot", recall_env)
     finally:
         server.shutdown()
         thread.join(timeout=2)

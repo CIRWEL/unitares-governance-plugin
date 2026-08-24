@@ -9,5 +9,3 @@ for the turn-to-turn flow of this conversation.
 Use `sync_state(...)` only for meaningful state worth reporting; do not
 manufacture a check-in to satisfy this note.
 Recovery: run /diagnose.
-
-UNITARES shared memory is available on demand via `search_shared_memory(query=...)`. Query it when prior federation state matters; inspect a finding before relying on it. No KG findings are injected automatically.

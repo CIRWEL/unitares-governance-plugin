@@ -39,5 +39,3 @@ Recovery: run /diagnose.
 
 --- Governance Fundamentals (via skill) ---
 Full reference available on demand: invoke `unitares-governance:governance-fundamentals` for metric semantics (EISV dimensions, basins, verdicts, calibration, recovery), or `unitares-governance:governance-lifecycle` for the identity ontology (onboarding, `force_new`, lineage via `parent_agent_id`, proof-owned resume). Read the relevant one before interpreting metrics or declaring lineage; do not guess semantics.
-
-UNITARES shared memory is available on demand via `search_shared_memory(query=...)`. Query it when prior federation state matters; inspect a finding before relying on it. No KG findings are injected automatically.
