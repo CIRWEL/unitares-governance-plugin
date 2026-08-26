@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# UNITARES Governance Plugin — host-specific PreToolUse shell hook
+#
+# Refuses a push to a branch whose pull request has already merged or closed,
+# which would orphan the commit. See scripts/merged_pr_guard.py for the failure
+# mode and why nothing else in the normal loop catches it.
+#
+# Fail-open at every step: a missing helper, a missing python3, or an
+# unreachable forge allows the push. The guard narrows the window; it does not
+# close it.
+#
+# Exit codes: 0 allow, 2 block (stderr reaches the calling agent).
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+HOOK_HOST="claude"
+if [[ "${1:-}" == "--host" && -n "${2:-}" ]]; then
+  HOOK_HOST="$2"
+fi
+# Bound to Claude only for now. Codex's shell tool name is not yet part of this
+# plugin's PreToolUse matchers, so there is nothing to bind against; the helper
+# itself is host-neutral and takes --host when that lands.
+if [[ "${HOOK_HOST}" != "claude" ]]; then
+  exit 0
+fi
+
+HOOK_INPUT=""
+if [[ ! -t 0 ]]; then
+  HOOK_INPUT=$(cat 2>/dev/null) || true
+fi
+[[ -z "${HOOK_INPUT}" ]] && exit 0
+
+# Cheap reject before paying for python3. This hook runs on every shell call,
+# and the overwhelming majority are not pushes.
+if [[ "${HOOK_INPUT}" != *push* ]]; then
+  exit 0
+fi
+
+HELPER="${PLUGIN_ROOT}/scripts/merged_pr_guard.py"
+[[ -f "${HELPER}" ]] || exit 0
+command -v python3 >/dev/null 2>&1 || exit 0
+
+printf '%s' "${HOOK_INPUT}" | python3 "${HELPER}" pre-push \
+  --workspace "${PWD}" --host "${HOOK_HOST}"
+HELPER_STATUS=$?
+
+# Only a deliberate refusal blocks. Any other non-zero status is a helper
+# problem, not evidence about the branch, and must not stop a delivery.
+if [[ "${HELPER_STATUS}" -eq 2 ]]; then
+  exit 2
+fi
+exit 0
