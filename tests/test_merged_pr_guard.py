@@ -151,3 +151,55 @@ def test_empty_stdin_allows_the_push():
 def test_payload_without_a_command_allows_the_push():
     body = json.dumps({"tool_name": "Bash", "tool_input": {}})
     assert guard.main(["pre-push"], stdin_text=body) == guard.ALLOW
+
+
+# --- which repository the branch is read from -------------------------------
+# This hook runs BEFORE the shell, so for `cd <worktree> && git push` the
+# process cwd is still the session's directory. Reading the branch there
+# refused a legitimate worktree push on 2026-08-28, naming a merged branch the
+# author had never checked out — the session directory happened to be sitting
+# on it. The guard has to resolve the repo the command targets.
+
+def test_cd_before_push_selects_that_directory(tmp_path):
+    target = tmp_path / "worktree"
+    target.mkdir()
+    resolved = guard.repo_dir(f"cd {target} && git commit -m x && git push", "/session")
+    assert resolved == str(target)
+
+
+def test_dash_c_still_wins_over_cd(tmp_path):
+    target = tmp_path / "explicit"
+    target.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    resolved = guard.repo_dir(f"cd {other} && git -C {target} push", "/session")
+    assert resolved == str(target)
+
+
+def test_cd_to_a_missing_directory_falls_back(tmp_path):
+    """Fail open: a path that does not resolve is not evidence about a branch."""
+    assert guard.repo_dir("cd /no/such/dir && git push", "/session") == "/session"
+
+
+def test_cd_after_the_push_is_ignored(tmp_path):
+    """Only a directory change that precedes the push can affect it."""
+    target = tmp_path / "later"
+    target.mkdir()
+    assert guard.repo_dir(f"git push && cd {target}", "/session") == "/session"
+
+
+def test_plain_push_still_uses_the_working_directory():
+    assert guard.repo_dir("git push", "/session") == "/session"
+
+
+def test_tilde_in_a_cd_path_is_expanded(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "wt").mkdir()
+    assert guard.repo_dir("cd ~/wt && git push", "/session") == str(tmp_path / "wt")
+
+
+def test_refusal_names_the_directory_it_read_from():
+    """A false positive is undiagnosable when the message asserts a branch the
+    author never touched and gives no hint where it looked."""
+    message = guard.refusal_text(1730, "feature/x", "MERGED", None, "/some/worktree")
+    assert "/some/worktree" in message

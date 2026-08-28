@@ -40,6 +40,12 @@ PROTECTED_BRANCHES = frozenset({"master", "main", "trunk", "develop", "HEAD"})
 
 _PUSH_RE = re.compile(r"(^|[;&|\s])git\s+([^;&|]*\s)?push(\s|$)")
 _DASH_C_RE = re.compile(r"git\s+-C\s+([^\s;&|]+)")
+# `cd <dir> && git push` is the other way an agent names the repo. Without
+# this the guard read the SESSION cwd instead: PreToolUse hooks run before
+# the shell, so the `cd` has not happened when the guard looks. That misread
+# a worktree push as a push to whatever branch the session directory
+# happened to be on, and refused it naming an unrelated branch.
+_CD_RE = re.compile(r"(?:^|[;&|]|&&)\s*cd\s+([^\s;&|]+)")
 _REFSPEC_RE = re.compile(
     r"git[^;&|]*push\s+[^;&|]*origin\s+(?:-u\s+|--set-upstream\s+)?"
     r"([A-Za-z0-9._/-]+)"
@@ -76,9 +82,39 @@ def is_push(command: str) -> bool:
 
 
 def repo_dir(command: str, cwd: str) -> str:
-    """Honour an explicit ``git -C <dir>``; otherwise the working directory."""
-    match = _DASH_C_RE.search(command or "")
-    return match.group(1) if match else cwd
+    """Resolve the repo the push targets, not merely where the shell started.
+
+    Precedence: an explicit ``git -C <dir>``, then the last ``cd <dir>`` that
+    precedes the push in the chain, then the working directory. The middle
+    case matters because this hook runs BEFORE the shell, so for
+    ``cd <worktree> && git push`` the process cwd is still the session's
+    directory — and reading the branch there refuses a legitimate push while
+    naming a branch the author never touched.
+
+    Fails open by design: a directory that does not resolve, or is not a git
+    repository, falls back rather than guessing. A guard that blocks on its
+    own confusion is worse than one that misses.
+    """
+    command = command or ""
+    match = _DASH_C_RE.search(command)
+    if match:
+        return _expand(match.group(1)) or cwd
+
+    push = _PUSH_RE.search(command)
+    limit = push.start() if push else len(command)
+    candidates = [m for m in _CD_RE.finditer(command) if m.start() < limit]
+    if candidates:
+        resolved = _expand(candidates[-1].group(1))
+        if resolved and os.path.isdir(resolved):
+            return resolved
+    return cwd
+
+
+def _expand(raw: str) -> str:
+    """Expand ~ and quoting on a path lifted out of a command string."""
+    if not raw:
+        return ""
+    return os.path.expanduser(raw.strip().strip("\"'"))
 
 
 def branch_from_command(command: str) -> str:
@@ -147,12 +183,22 @@ def lookup_pull_request(branch: str, cwd: str, timeout: float = 8.0) -> dict[str
     return {}
 
 
-def refusal_text(number: Any, branch: str, state: str, merged_at: Any) -> str:
+def refusal_text(
+    number: Any,
+    branch: str,
+    state: str,
+    merged_at: Any,
+    target: str = "",
+) -> str:
     verb = "closed" if str(state).upper() == "CLOSED" else "merged"
     when = f" (at {merged_at})" if merged_at else ""
+    # Name the directory the branch was read FROM. Without it a false positive
+    # is nearly undiagnosable: the message asserts a branch the author never
+    # checked out, with no clue that the guard looked somewhere else.
+    where = f"\nBranch read from: {target}\n" if target else ""
     return (
         f"BLOCKED: pull request #{number} for branch `{branch}` is already "
-        f"{verb}{when}.\n\n"
+        f"{verb}{when}.\n{where}\n"
         "Pushing here ORPHANS the commit. Nothing will merge this branch again, "
         "and the next merged-branch sweep will delete it.\n\n"
         "Move the work onto a fresh branch instead:\n\n"
@@ -207,6 +253,7 @@ def evaluate(
         branch,
         state,
         pull_request.get("mergedAt"),
+        target,
     )
 
 
