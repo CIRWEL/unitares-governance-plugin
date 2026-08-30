@@ -92,17 +92,30 @@ class _FakeTransport:
         return self._response
 
 
-def _onboard_ok_response(uuid: str, display_name: str) -> dict:
+def _onboard_ok_response(
+    uuid: str,
+    display_name: str,
+    *,
+    onboard_origin: str | None = None,
+    onboard_origin_basis: str | None = None,
+) -> dict:
+    result = {
+        "success": True,
+        "uuid": uuid,
+        "agent_id": f"Claude_Code_{uuid[:8]}",
+        "client_session_id": f"agent-{uuid[:12]}",
+        "continuity_token": f"token-{uuid}",
+        "session_resolution_source": "explicit_client_session_id_scoped",
+        "continuity_token_supported": True,
+        "display_name": display_name,
+    }
+    if onboard_origin is not None:
+        result["onboard_origin"] = onboard_origin
+    if onboard_origin_basis is not None:
+        result["onboard_origin_basis"] = onboard_origin_basis
     return {
         "result": {
-            "success": True,
-            "uuid": uuid,
-            "agent_id": f"Claude_Code_{uuid[:8]}",
-            "client_session_id": f"agent-{uuid[:12]}",
-            "continuity_token": f"token-{uuid}",
-            "session_resolution_source": "explicit_client_session_id_scoped",
-            "continuity_token_supported": True,
-            "display_name": display_name,
+            **result,
         }
     }
 
@@ -146,7 +159,46 @@ def test_unslotted_onboard_sends_bare_name_and_force_new(tmp_path: Path) -> None
     sent_args = transport.calls[0]["payload"]["arguments"]
     assert sent_args["name"] == "cirwel"
     assert sent_args["force_new"] is True
+    assert sent_args["onboard_origin"] == "harness_backstop"
     assert "parent_agent_id" not in sent_args
+
+
+def test_orchestrated_resume_reports_origin_and_caches_server_result(
+    tmp_path: Path,
+) -> None:
+    transport = _FakeTransport(
+        _onboard_ok_response(
+            "abab1111-0000-4000-8000-000000000000",
+            "cirwel",
+            onboard_origin="orchestrated_resume",
+            onboard_origin_basis="explicit_argument",
+        )
+    )
+
+    result = run_onboard(
+        server_url="http://unit-test",
+        agent_name="cirwel",
+        model_type="claude-code",
+        workspace=tmp_path,
+        slot="turn-2",
+        client_session_id="agent:/thread-1985",
+        orchestrated=True,
+        post_json=transport,
+    )
+
+    sent_args = transport.calls[0]["payload"]["arguments"]
+    assert sent_args["client_session_id"] == "agent:/thread-1985"
+    assert sent_args["orchestrated"] is True
+    assert sent_args["onboard_origin"] == "orchestrated_resume"
+    assert "force_new" not in sent_args
+
+    cached = json.loads(
+        (tmp_path / ".unitares" / "session-turn-2.json").read_text()
+    )
+    assert cached["onboard_origin"] == "orchestrated_resume"
+    assert cached["onboard_origin_basis"] == "explicit_argument"
+    assert result["onboard_origin"] == "orchestrated_resume"
+    assert result["onboard_origin_basis"] == "explicit_argument"
 
 
 def test_cache_file_is_mode_0600_and_omits_continuity_token(tmp_path: Path) -> None:
@@ -184,6 +236,10 @@ def test_cache_file_is_mode_0600_and_omits_continuity_token(tmp_path: Path) -> N
     written = json.loads(cache_file.read_text())
     assert "continuity_token" not in written
     assert "continuity_token_supported" not in written
+    assert "onboard_origin" not in written
+    assert "onboard_origin_basis" not in written
+    assert "onboard_origin" not in result
+    assert "onboard_origin_basis" not in result
     # Result still carries the transient token from the server response.
     assert result["continuity_token"]
     assert result["continuity_token_supported"] is True

@@ -82,6 +82,18 @@ at `~/.unitares-cache-authority/session-<slot>.json` also marks the optional
 HOME mirror invalid before mutation, so a failed mirror write or clear cannot
 revive stale identity through PWD fallback.
 
+The shared onboarding helper labels its automatic fresh-mint calls with
+`onboard_origin="harness_backstop"` and anchored orchestrator resumes with
+`onboard_origin="orchestrated_resume"`. If the server reports that value back,
+the helper preserves it in the slot cache and its result. Ordinary
+agent-authored `onboard` / `start_session` tool calls are not rewritten by the
+plugin; the server classifies their absent marker as `agent`. This provenance
+is operational observability only, not identity proof or an authorization
+signal. The server's companion `onboard_origin_basis` distinguishes an
+explicit adapter marker from that unmarked-call default; analytics should
+treat the default cohort as inferred rather than verified authorship. Deploy
+this marker-producing helper before the Core consumer during a staged upgrade.
+
 Claude's `PermissionDenied` event covers auto-mode classifier denials, not
 manual permission-dialog denials, deny-rule matches, or a PreToolUse denial.
 Failed edit execution is released by `PostToolUseFailure`; a synchronous
