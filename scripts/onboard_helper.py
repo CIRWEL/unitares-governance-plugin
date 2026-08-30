@@ -4,8 +4,10 @@
 Owns the flow:
 
 1. Read the existing slot-scoped session cache (if any).
-2. Call ``onboard(force_new=true)``. When the cache has a UUID, pass it as
-   ``parent_agent_id`` with ``spawn_reason="new_session"``.
+2. Call ``onboard(force_new=true, onboard_origin="harness_backstop")``. When
+   the cache has a UUID, pass it as ``parent_agent_id`` with
+   ``spawn_reason="new_session"``. Orchestrated anchor resumes instead report
+   ``onboard_origin="orchestrated_resume"``.
 3. If the server reports ``trajectory_required`` (identity exists but lacks
    a verifiable signal), return status=``trajectory_required`` with the
    server's recovery hint. We do NOT auto-retry with ``force_new=true``;
@@ -64,6 +66,8 @@ CacheGenerationToken = Tuple[int, Optional[int]]
 BOOTSTRAP_RESPONSE_TEXT = "Genesis: identity created via plugin onboard (trajectory seed)."
 BOOTSTRAP_COMPLEXITY = 0.1
 BOOTSTRAP_CONFIDENCE = 0.5
+HARNESS_BACKSTOP_ORIGIN = "harness_backstop"
+ORCHESTRATED_RESUME_ORIGIN = "orchestrated_resume"
 
 
 def _env_truthy(value: str | None) -> bool:
@@ -423,6 +427,7 @@ def run_onboard(
             "model_type": model_type,
             "client_session_id": anchor,
             "orchestrated": True,
+            "onboard_origin": ORCHESTRATED_RESUME_ORIGIN,
         }
     else:
         # Scope the name by slot so the server's name-claim lookup doesn't bind
@@ -434,6 +439,7 @@ def run_onboard(
             "name": scoped_name,
             "model_type": model_type,
             "force_new": True,
+            "onboard_origin": HARNESS_BACKSTOP_ORIGIN,
         }
         if parent_agent_id:
             arguments["parent_agent_id"] = parent_agent_id
@@ -481,6 +487,14 @@ def run_onboard(
         "session_resolution_source": parsed.get("session_resolution_source", ""),
         "display_name": parsed.get("display_name", ""),
     }
+    reported_origin = parsed.get("onboard_origin")
+    if isinstance(reported_origin, str) and reported_origin.strip():
+        # Cache only what the server reports, not what this helper requested.
+        # The marker is descriptive observability, never an identity proof.
+        new_cache["onboard_origin"] = reported_origin.strip()
+        reported_origin_basis = parsed.get("onboard_origin_basis")
+        if isinstance(reported_origin_basis, str) and reported_origin_basis.strip():
+            new_cache["onboard_origin_basis"] = reported_origin_basis.strip()
     if parent_agent_id:
         new_cache["parent_agent_id"] = parent_agent_id
         new_cache["spawn_reason"] = "new_session"
@@ -513,7 +527,7 @@ def run_onboard(
             "error": "session cache changed while onboarding; newer local state preserved",
         }
 
-    return {
+    result = {
         "status": "ok",
         "uuid": new_cache.get("uuid", ""),
         "agent_id": new_cache.get("agent_id", ""),
@@ -529,6 +543,16 @@ def run_onboard(
         ),
         "display_name": new_cache.get("display_name", ""),
     }
+    authoritative_origin = new_cache.get("onboard_origin")
+    if isinstance(authoritative_origin, str) and authoritative_origin.strip():
+        result["onboard_origin"] = authoritative_origin.strip()
+        authoritative_origin_basis = new_cache.get("onboard_origin_basis")
+        if (
+            isinstance(authoritative_origin_basis, str)
+            and authoritative_origin_basis.strip()
+        ):
+            result["onboard_origin_basis"] = authoritative_origin_basis.strip()
+    return result
 
 
 # --- CLI -------------------------------------------------------------------

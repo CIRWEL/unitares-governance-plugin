@@ -177,6 +177,10 @@ def test_post_stop_lazy_onboards_when_cache_missing(tmp_path):
     tool_names = [c.get("name") for c in LazyOnboardHandler.calls]
     assert tool_names == ["onboard", "process_agent_update"]
     assert LazyOnboardHandler.calls[0]["arguments"]["model_type"] == "claude-code"
+    assert (
+        LazyOnboardHandler.calls[0]["arguments"]["onboard_origin"]
+        == "harness_backstop"
+    )
 
     checkin = LazyOnboardHandler.calls[1]["arguments"]
     assert checkin["client_session_id"] == "agent-11111111-222"
